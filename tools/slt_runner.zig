@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
 
     var pass: usize = 0;
     var fail: usize = 0;
+    var fail_dump_count: usize = 0;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
@@ -45,26 +46,34 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, line, "query")) {
             const sort_mode = parseSortMode(line);
 
-            const sql = try readSqlBlock(allocator, &lines);
-            defer allocator.free(sql);
-
-            var expected = try readExpectedBlock(allocator, &lines);
+            var query_block = try readQueryBlock(allocator, &lines);
             defer {
-                for (expected.items) |item| allocator.free(item);
-                expected.deinit(allocator);
+                for (query_block.expected.items) |item| allocator.free(item);
+                query_block.expected.deinit(allocator);
             }
+
+            const sql = query_block.sql;
+            defer allocator.free(sql);
 
             var rows = db.query(allocator, sql);
             if (rows) |*rs| {
                 defer rs.deinit();
-                const ok = try compareResult(allocator, rs, sort_mode, expected.items);
+                const ok = try compareResult(allocator, rs, sort_mode, query_block.expected.items);
                 if (ok) {
                     pass += 1;
                 } else {
                     fail += 1;
+                    if (fail_dump_count < 5) {
+                        std.debug.print("query mismatch:\n{s}\n", .{sql});
+                        fail_dump_count += 1;
+                    }
                 }
-            } else |_| {
+            } else |err| {
                 fail += 1;
+                if (fail_dump_count < 5) {
+                    std.debug.print("query execution error ({s}):\n{s}\n", .{ @errorName(err), sql });
+                    fail_dump_count += 1;
+                }
             }
         }
     }
@@ -96,32 +105,45 @@ fn readSqlBlock(allocator: std.mem.Allocator, lines: anytype) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-fn readExpectedBlock(allocator: std.mem.Allocator, lines: anytype) !std.ArrayList([]const u8) {
-    var out = std.ArrayList([]const u8).empty;
+const QueryBlock = struct {
+    sql: []u8,
+    expected: std.ArrayList([]const u8),
+};
+
+fn readQueryBlock(allocator: std.mem.Allocator, lines: anytype) !QueryBlock {
+    var sql_buf = std.ArrayList(u8).empty;
+    errdefer sql_buf.deinit(allocator);
+
+    var expected = std.ArrayList([]const u8).empty;
     errdefer {
-        for (out.items) |line| allocator.free(line);
-        out.deinit(allocator);
+        for (expected.items) |line| allocator.free(line);
+        expected.deinit(allocator);
     }
 
     var found_sep = false;
     while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (line.len == 0) continue;
-        if (std.mem.eql(u8, line, "----")) {
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.eql(u8, trimmed, "----")) {
             found_sep = true;
             break;
         }
+        try sql_buf.appendSlice(allocator, line);
+        try sql_buf.append(allocator, '\n');
     }
 
-    if (!found_sep) return out;
+    if (!found_sep) return error.InvalidData;
 
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r");
         if (line.len == 0) break;
-        try out.append(allocator, try allocator.dupe(u8, line));
+        try expected.append(allocator, try allocator.dupe(u8, line));
     }
 
-    return out;
+    return .{
+        .sql = try sql_buf.toOwnedSlice(allocator),
+        .expected = expected,
+    };
 }
 
 fn compareResult(
