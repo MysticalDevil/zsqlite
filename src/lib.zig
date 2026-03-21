@@ -6,7 +6,7 @@ pub const Stmt = @import("engine.zig").Stmt;
 pub const Value = @import("value.zig").Value;
 
 const std = @import("std");
-const engine_mod = @import("engine.zig");
+pub const engine_internal_tests = @import("engine/internal_test.zig");
 
 test "create insert select" {
     var gpa = std.heap.DebugAllocator(.{}){};
