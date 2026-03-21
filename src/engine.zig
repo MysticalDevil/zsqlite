@@ -4,6 +4,11 @@ const sql = @import("sql.zig");
 const vm = @import("vm.zig");
 const expr_mod = @import("expr/mod.zig");
 const ops = @import("engine/value_ops.zig");
+const types = @import("engine/types.zig");
+pub const RowSet = types.RowSet;
+const Table = types.Table;
+const EvalCtx = types.EvalCtx;
+const SortRow = types.SortRow;
 
 pub const Error = error{
     OutOfMemory,
@@ -21,61 +26,6 @@ pub const ExecResult = struct {
 };
 
 pub const RowState = enum { row, done };
-
-pub const RowSet = struct {
-    allocator: std.mem.Allocator,
-    rows: std.ArrayList([]Value),
-
-    pub fn init(allocator: std.mem.Allocator) RowSet {
-        return .{ .allocator = allocator, .rows = std.ArrayList([]Value).empty };
-    }
-
-    pub fn deinit(self: *RowSet) void {
-        for (self.rows.items) |r| {
-            for (r) |v| switch (v) {
-                .text => |t| self.allocator.free(t),
-                .blob => |b| self.allocator.free(b),
-                else => {},
-            };
-            self.allocator.free(r);
-        }
-        self.rows.deinit(self.allocator);
-    }
-};
-
-const Table = struct {
-    name: []const u8,
-    columns: std.ArrayList([]const u8),
-    rows: std.ArrayList([]Value),
-
-    fn deinit(self: *Table, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        for (self.columns.items) |c| allocator.free(c);
-        self.columns.deinit(allocator);
-        for (self.rows.items) |row| {
-            for (row) |v| switch (v) {
-                .text => |t| allocator.free(t),
-                .blob => |b| allocator.free(b),
-                else => {},
-            };
-            allocator.free(row);
-        }
-        self.rows.deinit(allocator);
-    }
-};
-
-const EvalCtx = struct {
-    table: *const Table,
-    table_name: []const u8,
-    alias: ?[]const u8,
-    row: ?[]const Value,
-    parent: ?*const EvalCtx,
-};
-
-const SortRow = struct {
-    values: []Value,
-    keys: []Value,
-};
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -198,7 +148,7 @@ pub const Engine = struct {
             }
         }
 
-        if (isAggregateProjectionList(projections.items)) {
+        if (ops.isAggregateProjectionList(projections.items)) {
             const row = try self.evalAggregateRow(allocator, table, sel, projections.items, where_expr, parent_ctx, alias);
             try result.rows.append(allocator, row);
             return result;
@@ -223,7 +173,7 @@ pub const Engine = struct {
 
             if (where_expr) |w| {
                 const cond_val = try self.evalExpr(allocator, w, &ctx);
-                const cond = toSqlBool(cond_val);
+                const cond = ops.toSqlBool(cond_val);
                 if (!cond) continue;
             }
 
@@ -290,7 +240,7 @@ pub const Engine = struct {
     ) Error!Value {
         switch (pexpr.*) {
             .call => |call| {
-                if (eqlIgnoreCase(call.name, "count")) {
+                if (ops.eqlIgnoreCase(call.name, "count")) {
                     var count: i64 = 0;
                     for (table.rows.items) |source_row| {
                         var ctx = EvalCtx{
@@ -302,7 +252,7 @@ pub const Engine = struct {
                         };
                         if (where_expr) |w| {
                             const cond = try self.evalExpr(allocator, w, &ctx);
-                            if (!toSqlBool(cond)) continue;
+                            if (!ops.toSqlBool(cond)) continue;
                         }
                         seen_any_ptr.* = true;
                         if (call.star_arg) {
@@ -315,7 +265,7 @@ pub const Engine = struct {
                     }
                     return Value{ .integer = count };
                 }
-                if (eqlIgnoreCase(call.name, "avg")) {
+                if (ops.eqlIgnoreCase(call.name, "avg")) {
                     if (call.args.len != 1) return Error.InvalidSql;
                     var sum: f64 = 0;
                     var cnt: usize = 0;
@@ -329,10 +279,10 @@ pub const Engine = struct {
                         };
                         if (where_expr) |w| {
                             const cond = try self.evalExpr(allocator, w, &ctx);
-                            if (!toSqlBool(cond)) continue;
+                            if (!ops.toSqlBool(cond)) continue;
                         }
                         const v = try self.evalExpr(allocator, call.args[0], &ctx);
-                        if (toNumber(v)) |num| {
+                        if (ops.toNumber(v)) |num| {
                             sum += num;
                             cnt += 1;
                             seen_any_ptr.* = true;
@@ -370,7 +320,7 @@ pub const Engine = struct {
                         return .null;
                     },
                     .not_op => {
-                        const b = toSqlBool(inner);
+                        const b = ops.toSqlBool(inner);
                         return Value{ .integer = if (b) 0 else 1 };
                     },
                 }
@@ -378,21 +328,21 @@ pub const Engine = struct {
             .binary => |b| {
                 const l = try self.evalExpr(allocator, b.left, ctx);
                 const r = try self.evalExpr(allocator, b.right, ctx);
-                return evalBinary(b.op, l, r);
+                return ops.evalBinary(b.op, l, r);
             },
             .between => |b| {
                 const t = try self.evalExpr(allocator, b.target, ctx);
                 const lo = try self.evalExpr(allocator, b.low, ctx);
                 const hi = try self.evalExpr(allocator, b.high, ctx);
                 if (t == .null or lo == .null or hi == .null) return .null;
-                const left_cmp = compareValues(t, lo);
-                const right_cmp = compareValues(t, hi);
+                const left_cmp = ops.compareValues(t, lo);
+                const right_cmp = ops.compareValues(t, hi);
                 var ok = left_cmp >= 0 and right_cmp <= 0;
                 if (b.not_between) ok = !ok;
                 return Value{ .integer = if (ok) 1 else 0 };
             },
             .call => |call| {
-                if (eqlIgnoreCase(call.name, "abs")) {
+                if (ops.eqlIgnoreCase(call.name, "abs")) {
                     if (call.args.len != 1) return Error.InvalidSql;
                     const v = try self.evalExpr(allocator, call.args[0], ctx);
                     if (v == .integer) {
@@ -401,7 +351,7 @@ pub const Engine = struct {
                         return Value{ .integer = if (i < 0) -i else i };
                     }
                     if (v == .real) return Value{ .real = @abs(v.real) };
-                    if (toNumber(v)) |n| return Value{ .real = @abs(n) };
+                    if (ops.toNumber(v)) |n| return Value{ .real = @abs(n) };
                     return .null;
                 }
                 return Error.UnsupportedSql;
@@ -411,13 +361,13 @@ pub const Engine = struct {
                     const base = try self.evalExpr(allocator, base_expr, ctx);
                     for (c.whens) |w| {
                         const when_val = try self.evalExpr(allocator, w.cond, ctx);
-                        const cmp = evalBinary(.eq, base, when_val);
-                        if (toSqlBool(cmp)) return self.evalExpr(allocator, w.value, ctx);
+                        const cmp = ops.evalBinary(.eq, base, when_val);
+                        if (ops.toSqlBool(cmp)) return self.evalExpr(allocator, w.value, ctx);
                     }
                 } else {
                     for (c.whens) |w| {
                         const cond = try self.evalExpr(allocator, w.cond, ctx);
-                        if (toSqlBool(cond)) return self.evalExpr(allocator, w.value, ctx);
+                        if (ops.toSqlBool(cond)) return self.evalExpr(allocator, w.value, ctx);
                     }
                 }
                 if (c.else_expr) |e| return self.evalExpr(allocator, e, ctx);
@@ -453,9 +403,9 @@ pub const Engine = struct {
         while (cur) |c| {
             const matches_qualifier = if (qualifier) |q|
                 if (c.alias) |a|
-                    eqlIgnoreCase(q, a)
+                    ops.eqlIgnoreCase(q, a)
                 else
-                    eqlIgnoreCase(q, c.table_name)
+                    ops.eqlIgnoreCase(q, c.table_name)
             else
                 true;
             if (matches_qualifier and c.row != null) {
@@ -525,137 +475,12 @@ fn cloneResultValue(allocator: std.mem.Allocator, v: Value) Error!Value {
     };
 }
 
-fn isAggregateProjectionList(nodes: []const *expr_mod.Expr) bool {
-    for (nodes) |n| {
-        if (containsAggregateCall(n)) return true;
-    }
-    return false;
-}
-
-fn containsAggregateCall(node: *expr_mod.Expr) bool {
-    return switch (node.*) {
-        .call => |c| eqlIgnoreCase(c.name, "count") or eqlIgnoreCase(c.name, "avg"),
-        .unary => |u| containsAggregateCall(u.expr),
-        .binary => |b| containsAggregateCall(b.left) or containsAggregateCall(b.right),
-        .between => |b| containsAggregateCall(b.target) or containsAggregateCall(b.low) or containsAggregateCall(b.high),
-        .case_expr => |c| blk: {
-            if (c.base != null and containsAggregateCall(c.base.?)) break :blk true;
-            for (c.whens) |w| {
-                if (containsAggregateCall(w.cond) or containsAggregateCall(w.value)) break :blk true;
-            }
-            if (c.else_expr != null and containsAggregateCall(c.else_expr.?)) break :blk true;
-            break :blk false;
-        },
-        .subquery, .exists_subquery, .literal, .ident => false,
-    };
-}
-
-fn toNumber(v: Value) ?f64 {
-    return switch (v) {
-        .integer => |i| @as(f64, @floatFromInt(i)),
-        .real => |f| f,
-        .text => |t| std.fmt.parseFloat(f64, t) catch null,
-        else => null,
-    };
-}
-
-fn toSqlBool(v: Value) bool {
-    return switch (v) {
-        .null => false,
-        .integer => |i| i != 0,
-        .real => |f| f != 0,
-        .text => |t| {
-            if (std.fmt.parseFloat(f64, t)) |n| return n != 0 else |_| return t.len != 0;
-        },
-        .blob => |b| b.len != 0,
-    };
-}
-
-fn evalBinary(op: expr_mod.BinaryOp, l: Value, r: Value) Value {
-    switch (op) {
-        .add, .sub, .mul, .div => {
-            if (l == .null or r == .null) return .null;
-            const ln = toNumber(l) orelse return .null;
-            const rn = toNumber(r) orelse return .null;
-            switch (op) {
-                .add => return .{ .real = ln + rn },
-                .sub => return .{ .real = ln - rn },
-                .mul => return .{ .real = ln * rn },
-                .div => return .{ .real = if (rn == 0) 0 else ln / rn },
-                else => unreachable,
-            }
-        },
-        .eq => {
-            if (l == .null or r == .null) return .null;
-            return .{ .integer = if (l.eql(r)) 1 else 0 };
-        },
-        .ne => {
-            if (l == .null or r == .null) return .null;
-            return .{ .integer = if (l.eql(r)) 0 else 1 };
-        },
-        .lt, .le, .gt, .ge => {
-            if (l == .null or r == .null) return .null;
-            const cmp = compareValues(l, r);
-            return switch (op) {
-                .lt => .{ .integer = if (cmp < 0) 1 else 0 },
-                .le => .{ .integer = if (cmp <= 0) 1 else 0 },
-                .gt => .{ .integer = if (cmp > 0) 1 else 0 },
-                .ge => .{ .integer = if (cmp >= 0) 1 else 0 },
-                else => unreachable,
-            };
-        },
-        .and_op => {
-            const lb = toSqlBool(l);
-            const rb = toSqlBool(r);
-            return .{ .integer = if (lb and rb) 1 else 0 };
-        },
-        .or_op => {
-            const lb = toSqlBool(l);
-            const rb = toSqlBool(r);
-            return .{ .integer = if (lb or rb) 1 else 0 };
-        },
-    }
-}
-
-fn compareValues(a: Value, b: Value) i8 {
-    if (a == .null and b == .null) return 0;
-    if (a == .null) return -1;
-    if (b == .null) return 1;
-
-    if (toNumber(a)) |an| {
-        if (toNumber(b)) |bn| {
-            if (an < bn) return -1;
-            if (an > bn) return 1;
-            return 0;
-        }
-    }
-
-    if (a == .text and b == .text) {
-        const o = std.mem.order(u8, a.text, b.text);
-        return switch (o) {
-            .lt => -1,
-            .eq => 0,
-            .gt => 1,
-        };
-    }
-
-    return 0;
-}
-
 fn sortRowLessThan(_: void, a: SortRow, b: SortRow) bool {
     var i: usize = 0;
     while (i < a.keys.len and i < b.keys.len) : (i += 1) {
-        const cmp = compareValues(a.keys[i], b.keys[i]);
+        const cmp = ops.compareValues(a.keys[i], b.keys[i]);
         if (cmp < 0) return true;
         if (cmp > 0) return false;
     }
     return false;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
 }
