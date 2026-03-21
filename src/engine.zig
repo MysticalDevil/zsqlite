@@ -59,6 +59,7 @@ pub const Engine = struct {
                 return .{ .rows_affected = 1 };
             },
             .select => return Error.UnsupportedSql,
+            .compound_select => return Error.UnsupportedSql,
         }
     }
 
@@ -68,6 +69,7 @@ pub const Engine = struct {
         const stmt = sql.parse(arena.allocator(), sql_text) catch |err| return mapParseError(err);
         return switch (stmt) {
             .select => |sel| try self.executeSelect(allocator, sel, null),
+            .compound_select => |compound| try self.executeCompoundSelect(allocator, compound, null),
             else => Error.UnsupportedSql,
         };
     }
@@ -118,18 +120,54 @@ pub const Engine = struct {
         var result = RowSet.init(allocator);
         errdefer result.deinit();
 
-        const table = self.tables.getPtr(sel.table_name) orelse return Error.UnknownTable;
-        const alias = if (sel.table_alias) |a| a else sel.table_name;
+        if (sel.from.len == 0) return Error.InvalidSql;
 
         var expr_arena = std.heap.ArenaAllocator.init(allocator);
         defer expr_arena.deinit();
         const ea = expr_arena.allocator();
 
-        var projections = std.ArrayList(*expr_mod.Expr).empty;
+        const SourceRef = struct {
+            table: *const Table,
+            table_name: []const u8,
+            alias: ?[]const u8,
+        };
+
+        var sources = std.ArrayList(SourceRef).empty;
+        defer sources.deinit(ea);
+        for (sel.from) |from_item| {
+            const table = self.tables.getPtr(from_item.table_name) orelse return Error.UnknownTable;
+            try sources.append(ea, .{
+                .table = table,
+                .table_name = from_item.table_name,
+                .alias = from_item.alias,
+            });
+        }
+
+        const ProjectionKind = enum { expr, star_all, star_qualifier };
+        const Projection = struct {
+            kind: ProjectionKind,
+            expr: ?*expr_mod.Expr,
+            qualifier: ?[]const u8,
+        };
+
+        var projections = std.ArrayList(Projection).empty;
         defer projections.deinit(ea);
         for (sel.projections) |text| {
-            const parsed = expr_mod.parse(ea, text) catch return Error.InvalidSql;
-            try projections.append(ea, parsed);
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (std.mem.eql(u8, trimmed, "*")) {
+                try projections.append(ea, .{ .kind = .star_all, .expr = null, .qualifier = null });
+                continue;
+            }
+            if (parseQualifiedStar(trimmed)) |qual| {
+                try projections.append(ea, .{
+                    .kind = .star_qualifier,
+                    .expr = null,
+                    .qualifier = try ea.dupe(u8, qual),
+                });
+                continue;
+            }
+            const parsed = expr_mod.parse(ea, trimmed) catch return Error.InvalidSql;
+            try projections.append(ea, .{ .kind = .expr, .expr = parsed, .qualifier = null });
         }
 
         const where_expr = if (sel.where_expr) |w|
@@ -148,8 +186,25 @@ pub const Engine = struct {
             }
         }
 
-        if (ops.isAggregateProjectionList(projections.items)) {
-            const row = try self.evalAggregateRow(allocator, table, sel, projections.items, where_expr, parent_ctx, alias);
+        var aggregate_exprs = std.ArrayList(*expr_mod.Expr).empty;
+        defer aggregate_exprs.deinit(ea);
+        for (projections.items) |p| {
+            if (p.kind == .expr) try aggregate_exprs.append(ea, p.expr.?);
+        }
+
+        if (ops.isAggregateProjectionList(aggregate_exprs.items)) {
+            if (aggregate_exprs.items.len != projections.items.len) return Error.InvalidSql;
+            if (sources.items.len != 1) return Error.UnsupportedSql;
+            const primary = sources.items[0];
+            const row = try self.evalAggregateRow(
+                allocator,
+                primary.table,
+                sel,
+                aggregate_exprs.items,
+                where_expr,
+                parent_ctx,
+                primary.alias orelse primary.table_name,
+            );
             try result.rows.append(allocator, row);
             return result;
         }
@@ -162,25 +217,80 @@ pub const Engine = struct {
             rows.deinit(allocator);
         }
 
-        for (table.rows.items) |source_row| {
-            var ctx = EvalCtx{
-                .table = table,
-                .table_name = sel.table_name,
-                .alias = alias,
-                .row = source_row,
-                .parent = parent_ctx,
-            };
+        for (sources.items) |source| {
+            if (source.table.rows.items.len == 0) return result;
+        }
+
+        const idxs = try allocator.alloc(usize, sources.items.len);
+        defer allocator.free(idxs);
+        @memset(idxs, 0);
+
+        const ctx_chain = try allocator.alloc(EvalCtx, sources.items.len);
+        defer allocator.free(ctx_chain);
+
+        while (true) {
+            for (sources.items, 0..) |source, i| {
+                const parent = if (i == 0) parent_ctx else &ctx_chain[i - 1];
+                ctx_chain[i] = .{
+                    .table = source.table,
+                    .table_name = source.table_name,
+                    .alias = source.alias,
+                    .row = source.table.rows.items[idxs[i]],
+                    .parent = parent,
+                };
+            }
+            const ctx = &ctx_chain[sources.items.len - 1];
 
             if (where_expr) |w| {
-                const cond_val = try self.evalExpr(allocator, w, &ctx);
+                const cond_val = try self.evalExpr(allocator, w, ctx);
                 const cond = ops.toSqlBool(cond_val);
-                if (!cond) continue;
+                if (!cond) {
+                    if (!advanceRowIndices(sources.items, idxs)) break;
+                    continue;
+                }
             }
 
-            const out_row = try allocator.alloc(Value, projections.items.len);
-            for (projections.items, 0..) |pexpr, i| {
-                const val = try self.evalExpr(allocator, pexpr, &ctx);
-                out_row[i] = try cloneResultValue(allocator, val);
+            var out_count: usize = 0;
+            for (projections.items) |p| {
+                switch (p.kind) {
+                    .expr => out_count += 1,
+                    .star_all => {
+                        for (sources.items) |source| {
+                            out_count += source.table.columns.items.len;
+                        }
+                    },
+                    .star_qualifier => {
+                        const src_idx = findQualifiedSourceIndex(sources.items, p.qualifier.?) orelse return Error.UnknownColumn;
+                        out_count += sources.items[src_idx].table.columns.items.len;
+                    },
+                }
+            }
+
+            const out_row = try allocator.alloc(Value, out_count);
+            var out_idx: usize = 0;
+            for (projections.items) |p| {
+                switch (p.kind) {
+                    .expr => {
+                        const val = try self.evalExpr(allocator, p.expr.?, ctx);
+                        out_row[out_idx] = try cloneResultValue(allocator, val);
+                        out_idx += 1;
+                    },
+                    .star_all => {
+                        for (ctx_chain) |entry| {
+                            for (entry.row.?) |v| {
+                                out_row[out_idx] = try cloneResultValue(allocator, v);
+                                out_idx += 1;
+                            }
+                        }
+                    },
+                    .star_qualifier => {
+                        const src_idx = findQualifiedSourceIndex(sources.items, p.qualifier.?) orelse return Error.UnknownColumn;
+                        for (ctx_chain[src_idx].row.?) |v| {
+                            out_row[out_idx] = try cloneResultValue(allocator, v);
+                            out_idx += 1;
+                        }
+                    },
+                }
             }
 
             const keys = try allocator.alloc(Value, sel.order_by.len);
@@ -190,12 +300,13 @@ pub const Engine = struct {
                     keys[i] = try cloneResultValue(allocator, out_row[term.ordinal - 1]);
                 } else {
                     const oexpr = order_exprs.items[i] orelse return Error.InvalidSql;
-                    const kv = try self.evalExpr(allocator, oexpr, &ctx);
+                    const kv = try self.evalExpr(allocator, oexpr, ctx);
                     keys[i] = try cloneResultValue(allocator, kv);
                 }
             }
 
             try rows.append(allocator, .{ .values = out_row, .keys = keys });
+            if (!advanceRowIndices(sources.items, idxs)) break;
         }
 
         if (sel.order_by.len > 0) {
@@ -206,6 +317,117 @@ pub const Engine = struct {
             try result.rows.append(allocator, entry.values);
         }
         return result;
+    }
+
+    fn executeCompoundSelect(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        compound: sql.CompoundSelect,
+        parent_ctx: ?*const EvalCtx,
+    ) Error!RowSet {
+        if (compound.arms.len == 0) return Error.InvalidSql;
+        if (compound.ops.len + 1 != compound.arms.len) return Error.InvalidSql;
+
+        var arm_sets = std.ArrayList(RowSet).empty;
+        defer {
+            for (arm_sets.items) |*rs| rs.deinit();
+            arm_sets.deinit(allocator);
+        }
+        for (compound.arms) |arm_sql| {
+            try arm_sets.append(allocator, try self.queryTextWithParent(allocator, arm_sql, parent_ctx));
+        }
+
+        var groups = std.ArrayList(RowSet).empty;
+        defer {
+            for (groups.items) |*rs| rs.deinit();
+            groups.deinit(allocator);
+        }
+        var group_ops = std.ArrayList(sql.SetOp).empty;
+        defer group_ops.deinit(allocator);
+
+        var current = try cloneRowSet(allocator, &arm_sets.items[0]);
+        var current_owned = true;
+        defer {
+            if (current_owned) current.deinit();
+        }
+
+        for (compound.ops, 0..) |set_op, idx| {
+            const rhs = &arm_sets.items[idx + 1];
+            if (set_op == .intersect) {
+                const next = try rowSetIntersect(allocator, &current, rhs);
+                current.deinit();
+                current = next;
+                current_owned = true;
+                continue;
+            }
+
+            try groups.append(allocator, current);
+            current_owned = false;
+            try group_ops.append(allocator, set_op);
+            current = try cloneRowSet(allocator, rhs);
+            current_owned = true;
+        }
+        try groups.append(allocator, current);
+        current_owned = false;
+
+        if (groups.items.len == 0) return Error.InvalidSql;
+        var out = try cloneRowSet(allocator, &groups.items[0]);
+        errdefer out.deinit();
+
+        for (group_ops.items, 0..) |set_op, idx| {
+            const rhs = &groups.items[idx + 1];
+            switch (set_op) {
+                .union_all => {
+                    for (rhs.rows.items) |row| {
+                        try appendClonedRow(allocator, &out, row);
+                    }
+                },
+                .union_distinct => {
+                    try dedupRowsInPlace(allocator, &out);
+                    for (rhs.rows.items) |row| {
+                        try appendDistinctRow(allocator, &out, row);
+                    }
+                },
+                .except => {
+                    const next = try rowSetExcept(allocator, &out, rhs);
+                    out.deinit();
+                    out = next;
+                },
+                .intersect => {
+                    const next = try rowSetIntersect(allocator, &out, rhs);
+                    out.deinit();
+                    out = next;
+                },
+            }
+        }
+
+        if (compound.order_by.len > 0) {
+            var rows = std.ArrayList(SortRow).empty;
+            defer {
+                for (rows.items) |entry| {
+                    allocator.free(entry.keys);
+                }
+                rows.deinit(allocator);
+            }
+
+            for (out.rows.items) |row| {
+                const keys = try allocator.alloc(Value, compound.order_by.len);
+                for (compound.order_by, 0..) |term, i| {
+                    if (!term.is_ordinal) return Error.InvalidSql;
+                    if (term.ordinal == 0 or term.ordinal > row.len) return Error.InvalidSql;
+                    keys[i] = try cloneResultValue(allocator, row[term.ordinal - 1]);
+                }
+                try rows.append(allocator, .{ .values = row, .keys = keys });
+            }
+
+            std.sort.insertion(SortRow, rows.items, {}, sortRowLessThan);
+            out.rows.clearRetainingCapacity();
+            for (rows.items) |entry| {
+                try out.rows.append(allocator, entry.values);
+            }
+        }
+
+        return out;
     }
 
     fn evalAggregateRow(
@@ -245,7 +467,7 @@ pub const Engine = struct {
                     for (table.rows.items) |source_row| {
                         var ctx = EvalCtx{
                             .table = table,
-                            .table_name = sel.table_name,
+                            .table_name = sel.from[0].table_name,
                             .alias = alias,
                             .row = source_row,
                             .parent = parent_ctx,
@@ -272,7 +494,7 @@ pub const Engine = struct {
                     for (table.rows.items) |source_row| {
                         var ctx = EvalCtx{
                             .table = table,
-                            .table_name = sel.table_name,
+                            .table_name = sel.from[0].table_name,
                             .alias = alias,
                             .row = source_row,
                             .parent = parent_ctx,
@@ -341,6 +563,30 @@ pub const Engine = struct {
                 if (b.not_between) ok = !ok;
                 return Value{ .integer = if (ok) 1 else 0 };
             },
+            .is_null => |n| {
+                const v = try self.evalExpr(allocator, n.target, ctx);
+                const is_null = v == .null;
+                const out = if (n.not_null) !is_null else is_null;
+                return Value{ .integer = if (out) 1 else 0 };
+            },
+            .in_list => |n| {
+                const target = try self.evalExpr(allocator, n.target, ctx);
+                if (target == .null) return .null;
+
+                var has_null = false;
+                for (n.items) |item| {
+                    const rhs = try self.evalExpr(allocator, item, ctx);
+                    if (rhs == .null) {
+                        has_null = true;
+                        continue;
+                    }
+                    if (ops.compareValues(target, rhs) == 0) {
+                        return Value{ .integer = if (n.not_in) 0 else 1 };
+                    }
+                }
+                if (has_null) return .null;
+                return Value{ .integer = if (n.not_in) 1 else 0 };
+            },
             .call => |call| {
                 if (ops.eqlIgnoreCase(call.name, "abs")) {
                     if (call.args.len != 1) return Error.InvalidSql;
@@ -352,6 +598,13 @@ pub const Engine = struct {
                     }
                     if (v == .real) return Value{ .real = @abs(v.real) };
                     if (ops.toNumber(v)) |n| return Value{ .real = @abs(n) };
+                    return .null;
+                }
+                if (ops.eqlIgnoreCase(call.name, "coalesce")) {
+                    for (call.args) |arg| {
+                        const v = try self.evalExpr(allocator, arg, ctx);
+                        if (v != .null) return v;
+                    }
                     return .null;
                 }
                 return Error.UnsupportedSql;
@@ -389,11 +642,21 @@ pub const Engine = struct {
     }
 
     fn queryWithParent(self: *Engine, allocator: std.mem.Allocator, sql_text: []const u8, parent: *const EvalCtx) Error!RowSet {
+        return self.queryTextWithParent(allocator, sql_text, parent);
+    }
+
+    fn queryTextWithParent(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        sql_text: []const u8,
+        parent: ?*const EvalCtx,
+    ) Error!RowSet {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const stmt = sql.parse(arena.allocator(), sql_text) catch |err| return mapParseError(err);
         return switch (stmt) {
             .select => |sel| try self.executeSelect(allocator, sel, parent),
+            .compound_select => |compound| try self.executeCompoundSelect(allocator, compound, parent),
             else => Error.InvalidSql,
         };
     }
@@ -422,7 +685,7 @@ pub const Engine = struct {
         const stmt = sql.parse(arena.allocator(), sql_text) catch |err| return Engine.mapParseError(err);
 
         return switch (stmt) {
-            .select => .{ .row_set = try self.query(allocator, sql_text), .cursor = 0 },
+            .select, .compound_select => .{ .row_set = try self.query(allocator, sql_text), .cursor = 0 },
             else => blk: {
                 try self.exec(sql_text);
                 break :blk .{ .row_set = null, .cursor = 0 };
@@ -440,6 +703,38 @@ pub const Engine = struct {
         };
     }
 };
+
+fn parseQualifiedStar(text: []const u8) ?[]const u8 {
+    if (text.len < 3) return null;
+    if (text[text.len - 2] != '.' or text[text.len - 1] != '*') return null;
+    const qualifier = std.mem.trim(u8, text[0 .. text.len - 2], " \t\r\n");
+    if (qualifier.len == 0) return null;
+    return qualifier;
+}
+
+fn findQualifiedSourceIndex(sources: anytype, qualifier: []const u8) ?usize {
+    var found: ?usize = null;
+    for (sources, 0..) |source, i| {
+        const matches = ops.eqlIgnoreCase(qualifier, source.table_name) or
+            (source.alias != null and ops.eqlIgnoreCase(qualifier, source.alias.?));
+        if (!matches) continue;
+        if (found != null) return null;
+        found = i;
+    }
+    return found;
+}
+
+fn advanceRowIndices(sources: anytype, idxs: []usize) bool {
+    if (idxs.len == 0) return false;
+    var pos = idxs.len;
+    while (pos > 0) {
+        pos -= 1;
+        idxs[pos] += 1;
+        if (idxs[pos] < sources[pos].table.rows.items.len) return true;
+        idxs[pos] = 0;
+    }
+    return false;
+}
 
 pub const Stmt = struct {
     row_set: ?RowSet,
@@ -483,4 +778,87 @@ fn sortRowLessThan(_: void, a: SortRow, b: SortRow) bool {
         if (cmp > 0) return false;
     }
     return false;
+}
+
+fn cloneRowSet(allocator: std.mem.Allocator, src: *const RowSet) Error!RowSet {
+    var out = RowSet.init(allocator);
+    errdefer out.deinit();
+    for (src.rows.items) |row| {
+        try appendClonedRow(allocator, &out, row);
+    }
+    return out;
+}
+
+fn rowSetIntersect(allocator: std.mem.Allocator, left: *const RowSet, right: *const RowSet) Error!RowSet {
+    var out = RowSet.init(allocator);
+    errdefer out.deinit();
+    for (left.rows.items) |row| {
+        if (containsRow(right.rows.items, row) and !containsRow(out.rows.items, row)) {
+            try appendClonedRow(allocator, &out, row);
+        }
+    }
+    return out;
+}
+
+fn rowSetExcept(allocator: std.mem.Allocator, left: *const RowSet, right: *const RowSet) Error!RowSet {
+    var out = RowSet.init(allocator);
+    errdefer out.deinit();
+    for (left.rows.items) |row| {
+        if (!containsRow(right.rows.items, row) and !containsRow(out.rows.items, row)) {
+            try appendClonedRow(allocator, &out, row);
+        }
+    }
+    return out;
+}
+
+fn dedupRowsInPlace(allocator: std.mem.Allocator, rs: *RowSet) Error!void {
+    var i: usize = 0;
+    while (i < rs.rows.items.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < rs.rows.items.len) {
+            if (rowsEqual(rs.rows.items[i], rs.rows.items[j])) {
+                const removed = rs.rows.orderedRemove(j);
+                freeOwnedRow(allocator, removed);
+                continue;
+            }
+            j += 1;
+        }
+    }
+}
+
+fn freeOwnedRow(allocator: std.mem.Allocator, row: []Value) void {
+    for (row) |v| switch (v) {
+        .text => |t| allocator.free(t),
+        .blob => |b| allocator.free(b),
+        else => {},
+    };
+    allocator.free(row);
+}
+
+fn appendClonedRow(allocator: std.mem.Allocator, rs: *RowSet, row: []const Value) Error!void {
+    const copied = try allocator.alloc(Value, row.len);
+    for (row, 0..) |v, i| {
+        copied[i] = try cloneResultValue(allocator, v);
+    }
+    try rs.rows.append(allocator, copied);
+}
+
+fn appendDistinctRow(allocator: std.mem.Allocator, rs: *RowSet, row: []const Value) Error!void {
+    if (containsRow(rs.rows.items, row)) return;
+    try appendClonedRow(allocator, rs, row);
+}
+
+fn containsRow(rows: []const []Value, target: []const Value) bool {
+    for (rows) |row| {
+        if (rowsEqual(row, target)) return true;
+    }
+    return false;
+}
+
+fn rowsEqual(a: []const Value, b: []const Value) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |av, bv| {
+        if (ops.compareValues(av, bv) != 0) return false;
+    }
+    return true;
 }
