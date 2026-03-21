@@ -9,7 +9,7 @@ pub fn parseCreate(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
     const rparen = std.mem.lastIndexOfScalar(u8, after_kw, ')') orelse return types.ParseError.InvalidSql;
     if (rparen <= lparen + 1) return types.ParseError.InvalidSql;
 
-    const table_name = std.mem.trim(u8, after_kw[0..lparen], " \t");
+    const table_name = std.mem.trim(u8, after_kw[0..lparen], " \t\r\n");
     if (table_name.len == 0) return types.ParseError.InvalidSql;
 
     var cols = std.ArrayList([]const u8).empty;
@@ -17,7 +17,7 @@ pub fn parseCreate(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
 
     var col_it = std.mem.splitScalar(u8, after_kw[lparen + 1 .. rparen], ',');
     while (col_it.next()) |raw_col| {
-        const col = std.mem.trim(u8, raw_col, " \t");
+        const col = std.mem.trim(u8, raw_col, " \t\r\n");
         if (col.len == 0) continue;
         const col_name = firstToken(col);
         if (col_name.len == 0) return types.ParseError.InvalidSql;
@@ -35,8 +35,8 @@ pub fn parseCreate(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
 pub fn parseInsert(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
     const after_kw = sql_text["INSERT INTO ".len..];
     const values_pos = common.indexOfIgnoreCase(after_kw, " VALUES") orelse return types.ParseError.InvalidSql;
-    const target_part = std.mem.trim(u8, after_kw[0..values_pos], " \t");
-    const values_part = std.mem.trimStart(u8, after_kw[values_pos + " VALUES".len ..], " \t");
+    const target_part = std.mem.trim(u8, after_kw[0..values_pos], " \t\r\n");
+    const values_part = std.mem.trimStart(u8, after_kw[values_pos + " VALUES".len ..], " \t\r\n");
 
     if (target_part.len == 0) return types.ParseError.InvalidSql;
 
@@ -45,14 +45,14 @@ pub fn parseInsert(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
 
     if (std.mem.lastIndexOfScalar(u8, target_part, ')')) |rparen| {
         const lparen = std.mem.lastIndexOfScalar(u8, target_part[0..rparen], '(') orelse return types.ParseError.InvalidSql;
-        table_name = std.mem.trim(u8, target_part[0..lparen], " \t");
+        table_name = std.mem.trim(u8, target_part[0..lparen], " \t\r\n");
         const cols_part = target_part[lparen + 1 .. rparen];
 
         var cols = std.ArrayList([]const u8).empty;
         defer cols.deinit(allocator);
         var col_it = std.mem.splitScalar(u8, cols_part, ',');
         while (col_it.next()) |raw_col| {
-            const col = std.mem.trim(u8, raw_col, " \t");
+            const col = std.mem.trim(u8, raw_col, " \t\r\n");
             if (col.len == 0) return types.ParseError.InvalidSql;
             try cols.append(allocator, try allocator.dupe(u8, col));
         }
@@ -71,7 +71,7 @@ pub fn parseInsert(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
     const value_slice = values_part[lparen + 1 .. rparen];
     var lit_it = std.mem.splitScalar(u8, value_slice, ',');
     while (lit_it.next()) |raw_lit| {
-        const lit = std.mem.trim(u8, raw_lit, " \t");
+        const lit = std.mem.trim(u8, raw_lit, " \t\r\n");
         if (lit.len == 0) return types.ParseError.InvalidSql;
         try values.append(allocator, try parseLiteral(allocator, lit));
     }
@@ -100,6 +100,6 @@ fn parseLiteral(allocator: std.mem.Allocator, lit: []const u8) types.ParseError!
 }
 
 fn firstToken(s: []const u8) []const u8 {
-    var it = std.mem.splitAny(u8, s, " \t");
-    return it.first();
+    var it = std.mem.tokenizeAny(u8, s, " \t\r\n");
+    return it.next() orelse "";
 }

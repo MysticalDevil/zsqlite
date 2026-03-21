@@ -5,6 +5,8 @@ pub const Statement = types.Statement;
 pub const CreateTable = types.CreateTable;
 pub const Insert = types.Insert;
 pub const Select = types.Select;
+pub const CompoundSelect = types.CompoundSelect;
+pub const SetOp = types.SetOp;
 pub const OrderTerm = types.OrderTerm;
 
 pub const parse = @import("sql/parse.zig").parse;

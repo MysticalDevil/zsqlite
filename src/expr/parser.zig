@@ -93,6 +93,7 @@ const Parser = struct {
                 const high = try self.parseAdd();
                 return self.makeBetween(left, low, high, true);
             }
+            if (self.matchKeyword("IN")) return self.parseInList(left, true);
             self.idx -= 1;
         }
 
@@ -102,6 +103,13 @@ const Parser = struct {
             const high = try self.parseAdd();
             return self.makeBetween(left, low, high, false);
         }
+
+        if (self.matchKeyword("IS")) {
+            const not_null = self.matchKeyword("NOT");
+            if (!self.matchKeyword("NULL")) return ParseError.InvalidExpression;
+            return self.makeIsNull(left, not_null);
+        }
+        if (self.matchKeyword("IN")) return self.parseInList(left, false);
 
         if (self.matchKind(.eq)) return self.makeBinary(.eq, left, try self.parseAdd());
         if (self.matchKind(.ne)) return self.makeBinary(.ne, left, try self.parseAdd());
@@ -330,6 +338,39 @@ const Parser = struct {
             .low = low,
             .high = high,
             .not_between = not_between,
+        } };
+        return node;
+    }
+
+    fn makeIsNull(self: *Parser, target: *types.Expr, not_null: bool) ParseError!*types.Expr {
+        const node = try self.allocator.create(types.Expr);
+        node.* = .{ .is_null = .{
+            .target = target,
+            .not_null = not_null,
+        } };
+        return node;
+    }
+
+    fn parseInList(self: *Parser, target: *types.Expr, not_in: bool) ParseError!*types.Expr {
+        if (!self.matchKind(.lparen)) return ParseError.InvalidExpression;
+
+        var items = std.ArrayList(*types.Expr).empty;
+        defer items.deinit(self.allocator);
+
+        const first = try self.parseOr();
+        try items.append(self.allocator, first);
+        while (self.matchKind(.comma)) {
+            const item = try self.parseOr();
+            try items.append(self.allocator, item);
+        }
+
+        if (!self.matchKind(.rparen)) return ParseError.InvalidExpression;
+
+        const node = try self.allocator.create(types.Expr);
+        node.* = .{ .in_list = .{
+            .target = target,
+            .items = try items.toOwnedSlice(self.allocator),
+            .not_in = not_in,
         } };
         return node;
     }

@@ -116,6 +116,14 @@ pub fn containsAggregateCall(node: *expr_mod.Expr) bool {
         .unary => |u| containsAggregateCall(u.expr),
         .binary => |b| containsAggregateCall(b.left) or containsAggregateCall(b.right),
         .between => |b| containsAggregateCall(b.target) or containsAggregateCall(b.low) or containsAggregateCall(b.high),
+        .is_null => |n| containsAggregateCall(n.target),
+        .in_list => |n| blk: {
+            if (containsAggregateCall(n.target)) break :blk true;
+            for (n.items) |item| {
+                if (containsAggregateCall(item)) break :blk true;
+            }
+            break :blk false;
+        },
         .case_expr => |c| blk: {
             if (c.base != null and containsAggregateCall(c.base.?)) break :blk true;
             for (c.whens) |w| {

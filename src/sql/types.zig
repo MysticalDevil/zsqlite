@@ -6,6 +6,7 @@ pub const Statement = union(enum) {
     create_table: CreateTable,
     insert: Insert,
     select: Select,
+    compound_select: CompoundSelect,
 };
 
 pub const CreateTable = struct {
@@ -26,9 +27,26 @@ pub const OrderTerm = struct {
 };
 
 pub const Select = struct {
-    table_name: []const u8,
-    table_alias: ?[]const u8,
+    from: []const FromItem,
     projections: []const []const u8,
     where_expr: ?[]const u8,
+    order_by: []const OrderTerm,
+};
+
+pub const FromItem = struct {
+    table_name: []const u8,
+    alias: ?[]const u8,
+};
+
+pub const SetOp = enum {
+    union_distinct,
+    union_all,
+    intersect,
+    except,
+};
+
+pub const CompoundSelect = struct {
+    arms: []const []const u8,
+    ops: []const SetOp,
     order_by: []const OrderTerm,
 };
