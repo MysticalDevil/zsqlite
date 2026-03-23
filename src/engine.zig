@@ -234,6 +234,8 @@ pub const Engine = struct {
 
         var all_conjuncts = std.ArrayList(*expr_mod.Expr).empty;
         defer all_conjuncts.deinit(allocator);
+        var pair_masks = std.ArrayList(u64).empty;
+        defer pair_masks.deinit(allocator);
 
         var residual_filters = std.ArrayList(*expr_mod.Expr).empty;
         defer residual_filters.deinit(allocator);
@@ -248,6 +250,9 @@ pub const Engine = struct {
                 if (dep.supported and dep.mask != 0 and @popCount(dep.mask) == 1) {
                     const single_idx = @ctz(dep.mask);
                     try local_filters[single_idx].append(allocator, conjunct);
+                }
+                if (dep.supported and @popCount(dep.mask) == 2) {
+                    try pair_masks.append(allocator, dep.mask);
                 }
             }
         }
@@ -299,26 +304,56 @@ pub const Engine = struct {
         defer allocator.free(iter_order);
         const source_to_iter_pos = try allocator.alloc(usize, sources.items.len);
         defer allocator.free(source_to_iter_pos);
-        for (iter_order, 0..) |*slot, i| slot.* = i;
+        const chosen = try allocator.alloc(bool, sources.items.len);
+        defer allocator.free(chosen);
+        @memset(chosen, false);
 
-        var i_sort: usize = 1;
-        while (i_sort < iter_order.len) : (i_sort += 1) {
-            const key = iter_order[i_sort];
-            var j = i_sort;
-            while (j > 0) {
-                const prev = iter_order[j - 1];
-                const prev_filters = local_filters[prev].items.len;
-                const key_filters = local_filters[key].items.len;
-                const prev_len = source_lengths[prev];
-                const key_len = source_lengths[key];
-                const should_move = (key_filters > prev_filters) or
-                    (key_filters == prev_filters and key_len < prev_len) or
-                    (key_filters == prev_filters and key_len == prev_len and key < prev);
-                if (!should_move) break;
-                iter_order[j] = prev;
-                j -= 1;
+        var chosen_mask: u64 = 0;
+        for (iter_order) |*slot| {
+            var best_idx: ?usize = null;
+            var best_connected: usize = 0;
+            var best_local: usize = 0;
+            var best_len: usize = 0;
+
+            for (sources.items, 0..) |_, candidate_idx| {
+                if (chosen[candidate_idx]) continue;
+
+                var connected: usize = 0;
+                if (chosen_mask != 0) {
+                    const bit = (@as(u64, 1) << @intCast(candidate_idx));
+                    for (pair_masks.items) |mask| {
+                        if ((mask & bit) == 0) continue;
+                        if ((mask & chosen_mask) != 0) connected += 1;
+                    }
+                }
+                const local_count = local_filters[candidate_idx].items.len;
+                const candidate_len = source_lengths[candidate_idx];
+
+                if (best_idx == null) {
+                    best_idx = candidate_idx;
+                    best_connected = connected;
+                    best_local = local_count;
+                    best_len = candidate_len;
+                    continue;
+                }
+
+                const prefer = (connected > best_connected) or
+                    (connected == best_connected and local_count > best_local) or
+                    (connected == best_connected and local_count == best_local and candidate_len < best_len) or
+                    (connected == best_connected and local_count == best_local and candidate_len == best_len and candidate_idx < best_idx.?);
+
+                if (prefer) {
+                    best_idx = candidate_idx;
+                    best_connected = connected;
+                    best_local = local_count;
+                    best_len = candidate_len;
+                }
             }
-            iter_order[j] = key;
+
+            const picked = best_idx orelse return Error.InvalidSql;
+            slot.* = picked;
+            chosen[picked] = true;
+            chosen_mask |= (@as(u64, 1) << @intCast(picked));
         }
         for (iter_order, 0..) |src_idx, pos| {
             source_to_iter_pos[src_idx] = pos;
