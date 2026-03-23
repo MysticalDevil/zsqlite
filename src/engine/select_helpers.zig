@@ -55,6 +55,7 @@ pub fn exprDependency(
     return switch (node.*) {
         .literal => .{ .supported = true, .mask = 0 },
         .ident => |id| .{ .supported = true, .mask = @as(u64, 1) << @intCast(try resolveIdentifierSourceIndex(sources, id.qualifier, id.name, eqlIgnoreCase)) },
+        .cast_expr => |c| try exprDependency(c.expr, sources, eqlIgnoreCase),
         .unary => |u| try exprDependency(u.expr, sources, eqlIgnoreCase),
         .binary => |b| combineDependency(try exprDependency(b.left, sources, eqlIgnoreCase), try exprDependency(b.right, sources, eqlIgnoreCase)),
         .between => |b| combineDependency(

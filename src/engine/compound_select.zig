@@ -87,18 +87,23 @@ pub fn executeCompoundSelect(
     if (compound.order_by.len > 0) {
         var rows = std.ArrayList(SortRow).empty;
         defer {
-            for (rows.items) |entry| allocator.free(entry.keys);
+            for (rows.items) |entry| {
+                allocator.free(entry.keys);
+                allocator.free(entry.descending);
+            }
             rows.deinit(allocator);
         }
 
         for (out.rows.items) |row| {
             const keys = try allocator.alloc(@import("../value.zig").Value, compound.order_by.len);
+            const descending = try allocator.alloc(bool, compound.order_by.len);
             for (compound.order_by, 0..) |term, i| {
+                descending[i] = term.descending;
                 if (!term.is_ordinal) return Error.InvalidSql;
                 if (term.ordinal == 0 or term.ordinal > row.len) return Error.InvalidSql;
                 keys[i] = try result_utils.cloneResultValue(allocator, row[term.ordinal - 1]);
             }
-            try rows.append(allocator, .{ .values = row, .keys = keys });
+            try rows.append(allocator, .{ .values = row, .keys = keys, .descending = descending });
         }
 
         std.sort.heap(SortRow, rows.items, {}, result_utils.sortRowLessThan);

@@ -18,8 +18,8 @@ pub fn sortRowLessThan(_: void, a: SortRow, b: SortRow) bool {
     var i: usize = 0;
     while (i < a.keys.len and i < b.keys.len) : (i += 1) {
         const cmp = ops.compareValues(a.keys[i], b.keys[i]);
-        if (cmp < 0) return true;
-        if (cmp > 0) return false;
+        if (cmp < 0) return !a.descending[i];
+        if (cmp > 0) return a.descending[i];
     }
     return false;
 }

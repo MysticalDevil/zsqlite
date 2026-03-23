@@ -43,6 +43,75 @@ pub fn evalAggregateExpr(
     seen_any_ptr: *bool,
 ) Error!Value {
     switch (pexpr.*) {
+        .literal => |v| return v,
+        .cast_expr => |cast_expr| {
+            const value = try evalAggregateExpr(self, allocator, cast_expr.expr, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            if (value == .null) return .null;
+            if (ops.eqlIgnoreCase(cast_expr.target_type, "INTEGER")) {
+                return switch (value) {
+                    .integer => value,
+                    .real => |v| Value{ .integer = @as(i64, @intFromFloat(v)) },
+                    .text => |v| blk: {
+                        const parsed_int = std.fmt.parseInt(i64, v, 10) catch {
+                            const parsed_real = std.fmt.parseFloat(f64, v) catch 0;
+                            break :blk Value{ .integer = @as(i64, @intFromFloat(parsed_real)) };
+                        };
+                        break :blk Value{ .integer = parsed_int };
+                    },
+                    .blob => Value{ .integer = 0 },
+                    .null => .null,
+                };
+            }
+            return value;
+        },
+        .unary => |u| {
+            const inner = try evalAggregateExpr(self, allocator, u.expr, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            switch (u.op) {
+                .neg => {
+                    if (inner == .null) return .null;
+                    if (inner == .integer) return Value{ .integer = -inner.integer };
+                    if (inner == .real) return Value{ .real = -inner.real };
+                    if (ops.toNumber(inner)) |num| return Value{ .real = -num };
+                    return .null;
+                },
+                .not_op => {
+                    if (inner == .null) return .null;
+                    return Value{ .integer = if (ops.toSqlBool(inner)) 0 else 1 };
+                },
+            }
+        },
+        .binary => |b| {
+            const left = try evalAggregateExpr(self, allocator, b.left, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            const right = try evalAggregateExpr(self, allocator, b.right, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            if (b.op == .and_op) {
+                if (left != .null and !ops.toSqlBool(left)) return Value{ .integer = 0 };
+                if (right != .null and !ops.toSqlBool(right)) return Value{ .integer = 0 };
+                if (left == .null or right == .null) return .null;
+                return Value{ .integer = 1 };
+            }
+            if (b.op == .or_op) {
+                if (left != .null and ops.toSqlBool(left)) return Value{ .integer = 1 };
+                if (right != .null and ops.toSqlBool(right)) return Value{ .integer = 1 };
+                if (left == .null or right == .null) return .null;
+                return Value{ .integer = 0 };
+            }
+            return ops.evalBinary(b.op, left, right);
+        },
+        .between => |b| {
+            const target = try evalAggregateExpr(self, allocator, b.target, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            const low = try evalAggregateExpr(self, allocator, b.low, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            const high = try evalAggregateExpr(self, allocator, b.high, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            const ge = ops.evalBinary(.ge, target, low);
+            const le = ops.evalBinary(.le, target, high);
+            const between_value = sqlAnd(ge, le);
+            if (b.not_between) return sqlNot(between_value);
+            return between_value;
+        },
+        .is_null => |n| {
+            const value = try evalAggregateExpr(self, allocator, n.target, table, sel, where_expr, parent_ctx, alias, runtime, seen_any_ptr);
+            const is_null = value == .null;
+            return Value{ .integer = if (if (n.not_null) !is_null else is_null) 1 else 0 };
+        },
         .call => |call| {
             if (call.star_arg and call.distinct) return Error.InvalidSql;
             if (call.star_arg and !ops.eqlIgnoreCase(call.name, "count")) return Error.InvalidSql;
@@ -211,10 +280,7 @@ pub fn evalAggregateExpr(
             }
             return Error.UnsupportedSql;
         },
-        else => {
-            if (!seen_any_ptr.*) return .null;
-            return Error.UnsupportedSql;
-        },
+        else => return Error.UnsupportedSql,
     }
 }
 
@@ -226,4 +292,16 @@ pub fn aggregateValueText(allocator: std.mem.Allocator, value: Value) Error![]co
         .text => |v| try allocator.dupe(u8, v),
         .blob => try allocator.dupe(u8, "BLOB"),
     };
+}
+
+fn sqlNot(value: Value) Value {
+    if (value == .null) return .null;
+    return Value{ .integer = if (ops.toSqlBool(value)) 0 else 1 };
+}
+
+fn sqlAnd(left: Value, right: Value) Value {
+    if (left != .null and !ops.toSqlBool(left)) return Value{ .integer = 0 };
+    if (right != .null and !ops.toSqlBool(right)) return Value{ .integer = 0 };
+    if (left == .null or right == .null) return .null;
+    return Value{ .integer = 1 };
 }

@@ -119,6 +119,7 @@ pub fn containsAggregateCall(node: *expr_mod.Expr) bool {
             eqlIgnoreCase(c.name, "min") or
             eqlIgnoreCase(c.name, "max") or
             eqlIgnoreCase(c.name, "group_concat"),
+        .cast_expr => |c| containsAggregateCall(c.expr),
         .unary => |u| containsAggregateCall(u.expr),
         .binary => |b| containsAggregateCall(b.left) or containsAggregateCall(b.right),
         .between => |b| containsAggregateCall(b.target) or containsAggregateCall(b.low) or containsAggregateCall(b.high),

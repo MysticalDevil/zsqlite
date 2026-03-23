@@ -6,6 +6,7 @@ const result_utils = @import("result_utils.zig");
 const select_helpers = @import("select_helpers.zig");
 const shared = @import("shared.zig");
 const filter_plan = @import("filter_plan.zig");
+const source_materialize = @import("source_materialize.zig");
 
 const RowSet = shared.RowSet;
 const Table = shared.Table;
@@ -46,7 +47,9 @@ pub fn executeSelect(
     var sources = std.ArrayList(SourceRef).empty;
     defer sources.deinit(ea);
     for (sel.from) |from_item| {
-        const table = if (self.tables.getPtr(from_item.table_name)) |existing|
+        const table = if (from_item.subquery_sql != null)
+            try source_materialize.materializeSubquery(self, allocator, from_item, parent_ctx, rt, &temp_tables)
+        else if (self.tables.getPtr(from_item.table_name)) |existing|
             existing
         else if (self.views.getPtr(from_item.table_name)) |view|
             try self.materializeView(allocator, view, parent_ctx, rt, &temp_tables)
@@ -69,7 +72,7 @@ pub fn executeSelect(
     var projections = std.ArrayList(Projection).empty;
     defer projections.deinit(ea);
     for (sel.projections) |text| {
-        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        const trimmed = normalizeProjectionExpr(text);
         if (std.mem.eql(u8, trimmed, "*")) {
             try projections.append(ea, .{ .kind = .star_all, .expr = null, .qualifier = null });
             continue;
@@ -164,7 +167,10 @@ pub fn executeSelect(
     const order_by_count = sel.order_by.len;
     var rows = std.ArrayList(SortRow).empty;
     defer {
-        for (rows.items) |entry| allocator.free(entry.keys);
+        for (rows.items) |entry| {
+            allocator.free(entry.keys);
+            allocator.free(entry.descending);
+        }
         rows.deinit(allocator);
     }
 
@@ -440,7 +446,9 @@ pub fn executeSelect(
             try result.rows.append(allocator, out_row);
         } else {
             const keys = try allocator.alloc(@import("../value.zig").Value, order_by_count);
+            const descending = try allocator.alloc(bool, order_by_count);
             for (sel.order_by, 0..) |term, i| {
+                descending[i] = term.descending;
                 if (term.is_ordinal) {
                     if (term.ordinal == 0 or term.ordinal > out_row.len) return Error.InvalidSql;
                     keys[i] = try result_utils.cloneResultValue(allocator, out_row[term.ordinal - 1]);
@@ -450,7 +458,7 @@ pub fn executeSelect(
                     keys[i] = try result_utils.cloneResultValue(allocator, kv);
                 }
             }
-            try rows.append(allocator, .{ .values = out_row, .keys = keys });
+            try rows.append(allocator, .{ .values = out_row, .keys = keys, .descending = descending });
         }
         idxs[src_idx] += 1;
     }
@@ -463,4 +471,85 @@ pub fn executeSelect(
     }
     if (sel.distinct) result_utils.dedupRowsInPlace(allocator, &result);
     return result;
+}
+
+fn normalizeProjectionExpr(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (findTopLevelProjectionAlias(trimmed)) |idx| {
+        return std.mem.trim(u8, trimmed[0..idx], " \t\r\n");
+    }
+    if (findTopLevelBareAlias(trimmed)) |idx| {
+        return std.mem.trim(u8, trimmed[0..idx], " \t\r\n");
+    }
+    return trimmed;
+}
+
+fn findTopLevelProjectionAlias(text: []const u8) ?usize {
+    var in_string = false;
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i + 4 <= text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (c == '\'') in_string = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_string = true;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (depth != 0) continue;
+        if (std.mem.eql(u8, text[i .. i + 4], " AS ")) {
+            return i;
+        }
+    }
+    return null;
+}
+
+fn findTopLevelBareAlias(text: []const u8) ?usize {
+    var in_string = false;
+    var depth: usize = 0;
+    var last_space: ?usize = null;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (c == '\'') in_string = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_string = true;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (depth == 0 and std.ascii.isWhitespace(c)) last_space = i;
+    }
+
+    const idx = last_space orelse return null;
+    const prefix = std.mem.trim(u8, text[0..idx], " \t\r\n");
+    const suffix = std.mem.trim(u8, text[idx..], " \t\r\n");
+    if (prefix.len == 0 or suffix.len == 0) return null;
+    for (suffix) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+    }
+    const last = prefix[prefix.len - 1];
+    if (last == '+' or last == '-' or last == '*' or last == '/' or last == '(' or last == ',' or last == '<' or last == '>' or last == '=') {
+        return null;
+    }
+    return idx;
 }

@@ -55,6 +55,22 @@ pub const TriggerDef = struct {
     }
 };
 
+pub const IndexDef = struct {
+    name: []const u8,
+    table_name: []const u8,
+    unique: bool,
+    columns: std.ArrayList(sql.IndexColumn),
+
+    pub fn deinit(self: *IndexDef, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.table_name);
+        for (self.columns.items) |col| {
+            allocator.free(col.column_name);
+        }
+        self.columns.deinit(allocator);
+    }
+};
+
 pub const Error = error{
     OutOfMemory,
     TableAlreadyExists,

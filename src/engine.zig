@@ -21,13 +21,14 @@ const Table = shared.Table;
 const EvalCtx = shared.EvalCtx;
 const ViewDef = shared.ViewDef;
 const TriggerDef = shared.TriggerDef;
+const IndexDef = shared.IndexDef;
 const QueryRuntime = shared.QueryRuntime;
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     tables: std.StringHashMap(Table),
     views: std.StringHashMap(ViewDef),
-    indexes: std.StringHashMap([]const u8),
+    indexes: std.StringHashMap(IndexDef),
     triggers: std.StringHashMap(TriggerDef),
     metrics_data: QueryMetrics,
     metrics_enabled: bool,
@@ -37,7 +38,7 @@ pub const Engine = struct {
             .allocator = allocator,
             .tables = std.StringHashMap(Table).init(allocator),
             .views = std.StringHashMap(ViewDef).init(allocator),
-            .indexes = std.StringHashMap([]const u8).init(allocator),
+            .indexes = std.StringHashMap(IndexDef).init(allocator),
             .triggers = std.StringHashMap(TriggerDef).init(allocator),
             .metrics_data = .{},
             .metrics_enabled = false,
@@ -74,6 +75,7 @@ pub const Engine = struct {
                 return .{ .rows_affected = 1 };
             },
             .update => |upd| return .{ .rows_affected = try self.handleUpdate(upd) },
+            .delete => |del| return .{ .rows_affected = try self.handleDelete(del) },
             .drop_table => |drop_table| {
                 try self.handleDropTable(drop_table);
                 return .{ .rows_affected = 0 };
@@ -137,6 +139,10 @@ pub const Engine = struct {
 
     fn handleUpdate(self: *Engine, upd: sql.Update) Error!usize {
         return schema_ops.handleUpdate(self, upd);
+    }
+
+    fn handleDelete(self: *Engine, del: sql.Delete) Error!usize {
+        return schema_ops.handleDelete(self, del);
     }
 
     fn handleDropTable(self: *Engine, drop_table: sql.DropObject) Error!void {

@@ -19,6 +19,39 @@ pub fn evalExpr(
     switch (node.*) {
         .literal => |v| return v,
         .ident => |id| return self.resolveIdentifier(ctx, id.qualifier, id.name),
+        .cast_expr => |cast_expr| {
+            const value = try evalExpr(self, allocator, cast_expr.expr, ctx, runtime);
+            if (value == .null) return .null;
+            if (@import("value_ops.zig").eqlIgnoreCase(cast_expr.target_type, "INTEGER")) {
+                return switch (value) {
+                    .integer => value,
+                    .real => |v| Value{ .integer = @as(i64, @intFromFloat(v)) },
+                    .text => |v| blk: {
+                        const parsed_int = std.fmt.parseInt(i64, v, 10) catch {
+                            const parsed_real = std.fmt.parseFloat(f64, v) catch 0;
+                            break :blk Value{ .integer = @as(i64, @intFromFloat(parsed_real)) };
+                        };
+                        break :blk Value{ .integer = parsed_int };
+                    },
+                    .blob => Value{ .integer = 0 },
+                    .null => .null,
+                };
+            }
+            if (@import("value_ops.zig").eqlIgnoreCase(cast_expr.target_type, "REAL")) {
+                if (@import("value_ops.zig").toNumber(value)) |num| return Value{ .real = num };
+                return Value{ .real = 0 };
+            }
+            if (@import("value_ops.zig").eqlIgnoreCase(cast_expr.target_type, "TEXT")) {
+                return switch (value) {
+                    .text => |v| Value{ .text = try allocator.dupe(u8, v) },
+                    .integer => |v| Value{ .text = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+                    .real => |v| Value{ .text = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+                    .blob => Value{ .text = try allocator.dupe(u8, "BLOB") },
+                    .null => .null,
+                };
+            }
+            return value;
+        },
         .unary => |u| {
             const inner = try evalExpr(self, allocator, u.expr, ctx, runtime);
             switch (u.op) {
@@ -29,6 +62,7 @@ pub fn evalExpr(
                     return .null;
                 },
                 .not_op => {
+                    if (inner == .null) return .null;
                     const b = ops.toSqlBool(inner);
                     return Value{ .integer = if (b) 0 else 1 };
                 },
@@ -37,15 +71,19 @@ pub fn evalExpr(
         .binary => |b| {
             if (b.op == .and_op) {
                 const l = try evalExpr(self, allocator, b.left, ctx, runtime);
-                if (!ops.toSqlBool(l)) return Value{ .integer = 0 };
+                if (l != .null and !ops.toSqlBool(l)) return Value{ .integer = 0 };
                 const r = try evalExpr(self, allocator, b.right, ctx, runtime);
-                return Value{ .integer = if (ops.toSqlBool(r)) 1 else 0 };
+                if (r != .null and !ops.toSqlBool(r)) return Value{ .integer = 0 };
+                if (l == .null or r == .null) return .null;
+                return Value{ .integer = 1 };
             }
             if (b.op == .or_op) {
                 const l = try evalExpr(self, allocator, b.left, ctx, runtime);
-                if (ops.toSqlBool(l)) return Value{ .integer = 1 };
+                if (l != .null and ops.toSqlBool(l)) return Value{ .integer = 1 };
                 const r = try evalExpr(self, allocator, b.right, ctx, runtime);
-                return Value{ .integer = if (ops.toSqlBool(r)) 1 else 0 };
+                if (r != .null and ops.toSqlBool(r)) return Value{ .integer = 1 };
+                if (l == .null or r == .null) return .null;
+                return Value{ .integer = 0 };
             }
             const l = try evalExpr(self, allocator, b.left, ctx, runtime);
             const r = try evalExpr(self, allocator, b.right, ctx, runtime);
@@ -55,12 +93,11 @@ pub fn evalExpr(
             const t = try evalExpr(self, allocator, b.target, ctx, runtime);
             const lo = try evalExpr(self, allocator, b.low, ctx, runtime);
             const hi = try evalExpr(self, allocator, b.high, ctx, runtime);
-            if (t == .null or lo == .null or hi == .null) return .null;
-            const left_cmp = ops.compareValues(t, lo);
-            const right_cmp = ops.compareValues(t, hi);
-            var ok = left_cmp >= 0 and right_cmp <= 0;
-            if (b.not_between) ok = !ok;
-            return Value{ .integer = if (ok) 1 else 0 };
+            const ge = ops.evalBinary(.ge, t, lo);
+            const le = ops.evalBinary(.le, t, hi);
+            const between_value = sqlAnd(ge, le);
+            if (b.not_between) return sqlNot(between_value);
+            return between_value;
         },
         .is_null => |n| {
             const v = try evalExpr(self, allocator, n.target, ctx, runtime);
@@ -256,4 +293,16 @@ pub fn evalExpr(
             return Value{ .integer = if (rs.rows.items.len > 0) 1 else 0 };
         },
     }
+}
+
+fn sqlNot(value: Value) Value {
+    if (value == .null) return .null;
+    return Value{ .integer = if (ops.toSqlBool(value)) 0 else 1 };
+}
+
+fn sqlAnd(left: Value, right: Value) Value {
+    if (left != .null and !ops.toSqlBool(left)) return Value{ .integer = 0 };
+    if (right != .null and !ops.toSqlBool(right)) return Value{ .integer = 0 };
+    if (left == .null or right == .null) return .null;
+    return Value{ .integer = 1 };
 }

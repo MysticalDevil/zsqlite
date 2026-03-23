@@ -12,6 +12,7 @@ const EvalCtx = shared.EvalCtx;
 const ViewDef = shared.ViewDef;
 const QueryRuntime = shared.QueryRuntime;
 const Error = shared.Error;
+const IndexDef = shared.IndexDef;
 
 pub fn deinitEngine(self: anytype) void {
     var it = self.tables.iterator();
@@ -33,7 +34,8 @@ pub fn deinitEngine(self: anytype) void {
     var index_it = self.indexes.iterator();
     while (index_it.next()) |entry| {
         self.allocator.free(entry.key_ptr.*);
-        self.allocator.free(entry.value_ptr.*);
+        var index_def = entry.value_ptr.*;
+        index_def.deinit(self.allocator);
     }
     self.indexes.deinit();
 
@@ -74,7 +76,25 @@ pub fn handleCreateIndex(self: anytype, create: sql.CreateIndex) Error!void {
     errdefer self.allocator.free(key);
     const gop = try self.indexes.getOrPut(key);
     if (gop.found_existing) return Error.TableAlreadyExists;
-    gop.value_ptr.* = try self.allocator.dupe(u8, create.table_name);
+
+    var columns = std.ArrayList(sql.IndexColumn).empty;
+    errdefer {
+        for (columns.items) |col| self.allocator.free(col.column_name);
+        columns.deinit(self.allocator);
+    }
+    for (create.columns) |col| {
+        try columns.append(self.allocator, .{
+            .column_name = try self.allocator.dupe(u8, col.column_name),
+            .descending = col.descending,
+        });
+    }
+
+    gop.value_ptr.* = IndexDef{
+        .name = try self.allocator.dupe(u8, create.index_name),
+        .table_name = try self.allocator.dupe(u8, create.table_name),
+        .unique = create.unique,
+        .columns = columns,
+    };
 }
 
 pub fn handleCreateView(self: anytype, create: sql.CreateView) Error!void {
@@ -255,6 +275,49 @@ pub fn handleUpdate(self: anytype, upd: sql.Update) Error!usize {
     return rows_affected;
 }
 
+pub fn handleDelete(self: anytype, del: sql.Delete) Error!usize {
+    const table = self.tables.getPtr(del.table_name) orelse return Error.UnknownTable;
+
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const ea = arena.allocator();
+
+    const where_expr = if (del.where_expr) |text|
+        expr_mod.parse(ea, text) catch return Error.InvalidSql
+    else
+        null;
+
+    var runtime = QueryRuntime.init(self.allocator);
+    defer runtime.deinit(self.allocator);
+
+    var rows_affected: usize = 0;
+    var row_index: usize = 0;
+    while (row_index < table.rows.items.len) {
+        const row = table.rows.items[row_index];
+        var ctx = EvalCtx{
+            .table = table,
+            .table_name = del.table_name,
+            .alias = null,
+            .row = row,
+            .parent = null,
+        };
+
+        if (where_expr) |w| {
+            const cond = try self.evalExpr(self.allocator, w, &ctx, &runtime);
+            if (!@import("value_ops.zig").toSqlBool(cond)) {
+                row_index += 1;
+                continue;
+            }
+        }
+
+        const removed = table.rows.orderedRemove(row_index);
+        result_utils.freeOwnedRow(self.allocator, removed);
+        rows_affected += 1;
+    }
+
+    return rows_affected;
+}
+
 pub fn handleDropTable(self: anytype, drop_table: sql.DropObject) Error!void {
     const removed = self.tables.fetchRemove(drop_table.object_name);
     if (removed) |entry| {
@@ -266,7 +329,7 @@ pub fn handleDropTable(self: anytype, drop_table: sql.DropObject) Error!void {
         defer index_names.deinit(self.allocator);
         var it = self.indexes.iterator();
         while (it.next()) |index_entry| {
-            if (std.mem.eql(u8, index_entry.value_ptr.*, drop_table.object_name)) {
+            if (std.mem.eql(u8, index_entry.value_ptr.table_name, drop_table.object_name)) {
                 try index_names.append(self.allocator, index_entry.key_ptr.*);
             }
         }
@@ -295,7 +358,8 @@ pub fn handleDropIndex(self: anytype, drop_index: sql.DropObject) Error!void {
     const removed = self.indexes.fetchRemove(drop_index.object_name);
     if (removed) |entry| {
         self.allocator.free(entry.key);
-        self.allocator.free(entry.value);
+        var index_def = entry.value;
+        index_def.deinit(self.allocator);
         return;
     }
     if (drop_index.if_exists) return;

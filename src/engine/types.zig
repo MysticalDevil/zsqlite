@@ -57,4 +57,5 @@ pub const EvalCtx = struct {
 pub const SortRow = struct {
     values: []Value,
     keys: []Value,
+    descending: []bool,
 };

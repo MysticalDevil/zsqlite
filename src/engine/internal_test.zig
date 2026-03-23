@@ -115,6 +115,82 @@ test "parser handles trigger timing and event variants" {
     try std.testing.expectEqual(sql.TriggerEvent.update, plain_update.create_trigger.event);
 }
 
+test "parser handles unique index columns select all and index hints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const create_index = try sql.parse(arena.allocator(), "CREATE UNIQUE INDEX idx1 ON t1 (a DESC, b)");
+    try std.testing.expect(create_index == .create_index);
+    try std.testing.expect(create_index.create_index.unique);
+    try std.testing.expectEqual(@as(usize, 2), create_index.create_index.columns.len);
+    try std.testing.expectEqualStrings("a", create_index.create_index.columns[0].column_name);
+    try std.testing.expect(create_index.create_index.columns[0].descending);
+    try std.testing.expectEqualStrings("b", create_index.create_index.columns[1].column_name);
+    try std.testing.expect(!create_index.create_index.columns[1].descending);
+
+    const select_all = try sql.parse(arena.allocator(), "SELECT ALL * FROM t1 INDEXED BY idx1");
+    try std.testing.expect(select_all == .select);
+    try std.testing.expect(!select_all.select.distinct);
+    try std.testing.expectEqualStrings("idx1", select_all.select.from[0].index_hint.indexed_by);
+
+    const select_not_indexed = try sql.parse(arena.allocator(), "SELECT * FROM t1 NOT INDEXED");
+    try std.testing.expect(select_not_indexed == .select);
+    try std.testing.expect(select_not_indexed.select.from[0].index_hint == .not_indexed);
+}
+
+test "parser and engine handle cast to integer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const stmt = try sql.parse(arena.allocator(), "SELECT CAST(x AS INTEGER) FROM t1");
+    try std.testing.expect(stmt == .select);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("INSERT INTO t1 VALUES ('39.8')");
+    var rows = try db.query(allocator, "SELECT CAST(x AS INTEGER), CAST(7.9 AS INTEGER), CAST(NULL AS INTEGER) FROM t1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 39 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .integer = 7 }));
+    try std.testing.expect(rows.rows.items[0][2] == .null);
+}
+
+test "derived table in FROM can be queried by alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const stmt = try sql.parse(arena.allocator(), "SELECT pk FROM (SELECT pk, col0 FROM tab0) AS d0");
+    try std.testing.expect(stmt == .select);
+    try std.testing.expectEqualStrings("d0", stmt.select.from[0].table_name);
+    try std.testing.expect(stmt.select.from[0].subquery_sql != null);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE tab0(pk, col0)");
+    try db.exec("INSERT INTO tab0 VALUES (1, 10)");
+    try db.exec("INSERT INTO tab0 VALUES (2, 20)");
+
+    var rows = try db.query(allocator, "SELECT pk FROM (SELECT pk, col0 FROM tab0) AS d0 ORDER BY 1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 1 }));
+    try std.testing.expect(rows.rows.items[1][0].eql(.{ .integer = 2 }));
+}
+
 test "compound query with in lists resolves columns per arm" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
@@ -357,6 +433,32 @@ test "update without where touches all rows" {
 
     try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
     try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
+}
+
+test "delete with where removes matching rows only" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x, y)");
+    try db.exec("INSERT INTO t1 VALUES (1, 'keep')");
+    try db.exec("INSERT INTO t1 VALUES (2, 'drop')");
+    try db.exec("INSERT INTO t1 VALUES (3, 'keep')");
+
+    const result = try db.exec("DELETE FROM t1 WHERE x=2");
+    try std.testing.expectEqual(@as(usize, 1), result.rows_affected);
+
+    var rows = try db.query(allocator, "SELECT x, y FROM t1 ORDER BY 1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 1 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .text = "keep" }));
+    try std.testing.expect(rows.rows.items[1][0].eql(.{ .integer = 3 }));
+    try std.testing.expect(rows.rows.items[1][1].eql(.{ .text = "keep" }));
 }
 
 test "replace overwrites existing primary key row" {
