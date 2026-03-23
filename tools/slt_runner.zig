@@ -448,11 +448,10 @@ fn compareResult(
         defer row_buf.deinit(allocator);
 
         for (row, 0..) |v, i| {
-            const tok = try valueToOwnedString(allocator, v);
-            try tokens.append(allocator, tok);
-
             if (i != 0) try row_buf.append(allocator, '\x1f');
-            try row_buf.appendSlice(allocator, tok);
+            const start = row_buf.items.len;
+            try appendValueString(&row_buf, allocator, v);
+            try tokens.append(allocator, try allocator.dupe(u8, row_buf.items[start..]));
         }
 
         try row_strings.append(allocator, try row_buf.toOwnedSlice(allocator));
@@ -507,10 +506,8 @@ fn compareRowsortHashFast(
         var row_buf = std.ArrayList(u8).empty;
         defer row_buf.deinit(allocator);
         for (row, 0..) |v, i| {
-            const tok = try valueToOwnedString(allocator, v);
-            defer allocator.free(tok);
             if (i != 0) try row_buf.append(allocator, '\x1f');
-            try row_buf.appendSlice(allocator, tok);
+            try appendValueString(&row_buf, allocator, v);
         }
         try row_strings.append(allocator, try row_buf.toOwnedSlice(allocator));
     }
@@ -520,12 +517,7 @@ fn compareRowsortHashFast(
     var hasher = std.crypto.hash.Md5.init(.{});
     var actual_count: usize = 0;
     for (row_strings.items) |row_text| {
-        var it = std.mem.splitScalar(u8, row_text, '\x1f');
-        while (it.next()) |tok| {
-            hasher.update(tok);
-            hasher.update("\n");
-            actual_count += 1;
-        }
+        actual_count += hashRowTokens(&hasher, row_text);
     }
     var digest: [16]u8 = undefined;
     hasher.final(&digest);
@@ -661,10 +653,8 @@ fn dumpActualSample(
         var row_buf = std.ArrayList(u8).empty;
         defer row_buf.deinit(allocator);
         for (row, 0..) |v, i| {
-            const tok = try valueToOwnedString(allocator, v);
-            defer allocator.free(tok);
             if (i != 0) try row_buf.append(allocator, '\x1f');
-            try row_buf.appendSlice(allocator, tok);
+            try appendValueString(&row_buf, allocator, v);
         }
         try row_strings.append(allocator, try row_buf.toOwnedSlice(allocator));
     }
@@ -688,6 +678,41 @@ fn valueToOwnedString(allocator: std.mem.Allocator, value: zsqlite.Value) ![]con
         .text => |v| try allocator.dupe(u8, v),
         .blob => try allocator.dupe(u8, "BLOB"),
     };
+}
+
+fn appendValueString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: zsqlite.Value) !void {
+    switch (value) {
+        .null => try buf.appendSlice(allocator, "NULL"),
+        .integer => |v| {
+            var scratch: [64]u8 = undefined;
+            const text = try std.fmt.bufPrint(&scratch, "{d}", .{v});
+            try buf.appendSlice(allocator, text);
+        },
+        .real => |v| {
+            var scratch: [64]u8 = undefined;
+            const text = try std.fmt.bufPrint(&scratch, "{d}", .{v});
+            try buf.appendSlice(allocator, text);
+        },
+        .text => |v| try buf.appendSlice(allocator, v),
+        .blob => try buf.appendSlice(allocator, "BLOB"),
+    }
+}
+
+fn hashRowTokens(hasher: *std.crypto.hash.Md5, row_text: []const u8) usize {
+    var token_count: usize = 0;
+    var start: usize = 0;
+    var idx: usize = 0;
+    while (idx < row_text.len) : (idx += 1) {
+        if (row_text[idx] != '\x1f') continue;
+        hasher.update(row_text[start..idx]);
+        hasher.update("\n");
+        token_count += 1;
+        start = idx + 1;
+    }
+    hasher.update(row_text[start..]);
+    hasher.update("\n");
+    token_count += 1;
+    return token_count;
 }
 
 fn lessString(_: void, a: []const u8, b: []const u8) bool {
