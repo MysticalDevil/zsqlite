@@ -9,6 +9,7 @@ pub const Statement = union(enum) {
     create_trigger: CreateTrigger,
     insert: Insert,
     update: Update,
+    delete: Delete,
     drop_table: DropObject,
     drop_index: DropObject,
     drop_trigger: DropObject,
@@ -28,6 +29,13 @@ pub const CreateTable = struct {
 pub const CreateIndex = struct {
     index_name: []const u8,
     table_name: []const u8,
+    unique: bool,
+    columns: []const IndexColumn,
+};
+
+pub const IndexColumn = struct {
+    column_name: []const u8,
+    descending: bool,
 };
 
 pub const CreateView = struct {
@@ -74,6 +82,11 @@ pub const Update = struct {
     where_expr: ?[]const u8,
 };
 
+pub const Delete = struct {
+    table_name: []const u8,
+    where_expr: ?[]const u8,
+};
+
 pub const DropObject = struct {
     object_name: []const u8,
     if_exists: bool,
@@ -87,6 +100,7 @@ pub const OrderTerm = struct {
     expr: []const u8,
     is_ordinal: bool,
     ordinal: usize,
+    descending: bool,
 };
 
 pub const Select = struct {
@@ -99,7 +113,15 @@ pub const Select = struct {
 
 pub const FromItem = struct {
     table_name: []const u8,
+    subquery_sql: ?[]const u8,
     alias: ?[]const u8,
+    index_hint: IndexHint,
+};
+
+pub const IndexHint = union(enum) {
+    none,
+    not_indexed,
+    indexed_by: []const u8,
 };
 
 pub const SetOp = enum {

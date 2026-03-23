@@ -65,6 +65,10 @@ pub const InList = struct {
 pub const Expr = union(enum) {
     literal: Value,
     ident: Identifier,
+    cast_expr: struct {
+        expr: *Expr,
+        target_type: []const u8,
+    },
     unary: struct {
         op: UnaryOp,
         expr: *Expr,

@@ -44,7 +44,11 @@ pub fn parseCreate(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
 }
 
 pub fn parseCreateIndex(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
-    const after_kw = sql_text["CREATE INDEX ".len..];
+    const after_kw = if (common.startsWithIgnoreCase(sql_text, "CREATE UNIQUE INDEX "))
+        sql_text["CREATE UNIQUE INDEX ".len..]
+    else
+        sql_text["CREATE INDEX ".len..];
+    const unique = common.startsWithIgnoreCase(sql_text, "CREATE UNIQUE INDEX ");
     const on_idx = common.indexOfIgnoreCase(after_kw, " ON ") orelse return types.ParseError.InvalidSql;
     const index_name = std.mem.trim(u8, after_kw[0..on_idx], " \t\r\n");
     if (index_name.len == 0) return types.ParseError.InvalidSql;
@@ -57,12 +61,36 @@ pub fn parseCreateIndex(allocator: std.mem.Allocator, sql_text: []const u8) type
     const table_name = std.mem.trim(u8, after_on[0..lparen], " \t\r\n");
     if (table_name.len == 0) return types.ParseError.InvalidSql;
 
-    const cols = std.mem.trim(u8, after_on[lparen + 1 .. rparen], " \t\r\n");
-    if (cols.len == 0) return types.ParseError.InvalidSql;
+    const cols_text = std.mem.trim(u8, after_on[lparen + 1 .. rparen], " \t\r\n");
+    if (cols_text.len == 0) return types.ParseError.InvalidSql;
+
+    const parts = try common.splitTopLevelComma(allocator, cols_text);
+    var columns = std.ArrayList(types.IndexColumn).empty;
+    defer columns.deinit(allocator);
+    for (parts) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) return types.ParseError.InvalidSql;
+        var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+        const column_name = it.next() orelse return types.ParseError.InvalidSql;
+        var descending = false;
+        if (it.next()) |direction| {
+            if (common.eqlIgnoreCase(direction, "DESC")) {
+                descending = true;
+            } else if (!common.eqlIgnoreCase(direction, "ASC")) {
+                return types.ParseError.UnsupportedSql;
+            }
+        }
+        try columns.append(allocator, .{
+            .column_name = try allocator.dupe(u8, column_name),
+            .descending = descending,
+        });
+    }
 
     return .{ .create_index = .{
         .index_name = try allocator.dupe(u8, index_name),
         .table_name = try allocator.dupe(u8, table_name),
+        .unique = unique,
+        .columns = try columns.toOwnedSlice(allocator),
     } };
 }
 
@@ -198,6 +226,27 @@ pub fn parseUpdate(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
     return .{ .update = .{
         .table_name = try allocator.dupe(u8, table_name),
         .assignments = try assignments.toOwnedSlice(allocator),
+        .where_expr = where_expr,
+    } };
+}
+
+pub fn parseDelete(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
+    const after_kw = std.mem.trim(u8, sql_text["DELETE FROM ".len..], " \t\r\n");
+    const where_idx = common.findTopLevelKeyword(after_kw, "WHERE");
+    const table_name = if (where_idx) |idx|
+        std.mem.trim(u8, after_kw[0..idx], " \t\r\n")
+    else
+        std.mem.trim(u8, after_kw, " \t\r\n");
+    if (table_name.len == 0) return types.ParseError.InvalidSql;
+
+    const where_expr = if (where_idx) |idx| blk: {
+        const text = std.mem.trim(u8, after_kw[idx + "WHERE".len ..], " \t\r\n");
+        if (text.len == 0) return types.ParseError.InvalidSql;
+        break :blk try allocator.dupe(u8, text);
+    } else null;
+
+    return .{ .delete = .{
+        .table_name = try allocator.dupe(u8, table_name),
         .where_expr = where_expr,
     } };
 }

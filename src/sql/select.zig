@@ -71,25 +71,63 @@ pub fn parseSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
 }
 
 fn parseFromItem(allocator: std.mem.Allocator, text: []const u8) types.ParseError!types.FromItem {
-    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return types.ParseError.InvalidSql;
+
+    if (trimmed[0] == '(') {
+        const close_idx = findMatchingCloseParen(trimmed) orelse return types.ParseError.InvalidSql;
+        const subquery_sql = std.mem.trim(u8, trimmed[1..close_idx], " \t\r\n");
+        if (subquery_sql.len == 0) return types.ParseError.InvalidSql;
+
+        const rest = std.mem.trim(u8, trimmed[close_idx + 1 ..], " \t\r\n");
+        if (rest.len == 0) return types.ParseError.InvalidSql;
+
+        var alias_text = rest;
+        if (common.startsWithIgnoreCase(rest, "AS ")) {
+            alias_text = std.mem.trim(u8, rest["AS ".len ..], " \t\r\n");
+        }
+        if (alias_text.len == 0 or std.mem.indexOfAny(u8, alias_text, " \t\r\n") != null) return types.ParseError.InvalidSql;
+
+        return .{
+            .table_name = try allocator.dupe(u8, alias_text),
+            .subquery_sql = try allocator.dupe(u8, subquery_sql),
+            .alias = try allocator.dupe(u8, alias_text),
+            .index_hint = .none,
+        };
+    }
+
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
     const table_name = it.next() orelse return types.ParseError.InvalidSql;
 
     var alias: ?[]const u8 = null;
-    if (it.next()) |second| {
-        if (common.eqlIgnoreCase(second, "NOT")) {
-            const third = it.next() orelse return types.ParseError.InvalidSql;
-            if (!common.eqlIgnoreCase(third, "INDEXED")) return types.ParseError.InvalidSql;
-        } else if (common.eqlIgnoreCase(second, "AS")) {
+    var index_hint: types.IndexHint = .none;
+
+    while (it.next()) |token| {
+        if (common.eqlIgnoreCase(token, "AS")) {
             const alias_name = it.next() orelse return types.ParseError.InvalidSql;
             alias = try allocator.dupe(u8, alias_name);
-        } else {
-            alias = try allocator.dupe(u8, second);
+            continue;
         }
+        if (common.eqlIgnoreCase(token, "NOT")) {
+            const third = it.next() orelse return types.ParseError.InvalidSql;
+            if (!common.eqlIgnoreCase(third, "INDEXED")) return types.ParseError.InvalidSql;
+            index_hint = .not_indexed;
+            continue;
+        }
+        if (common.eqlIgnoreCase(token, "INDEXED")) {
+            if (!common.eqlIgnoreCase(it.next() orelse return types.ParseError.InvalidSql, "BY")) return types.ParseError.InvalidSql;
+            const index_name = it.next() orelse return types.ParseError.InvalidSql;
+            index_hint = .{ .indexed_by = try allocator.dupe(u8, index_name) };
+            continue;
+        }
+        alias = try allocator.dupe(u8, token);
     }
 
     return .{
         .table_name = try allocator.dupe(u8, table_name),
+        .subquery_sql = null,
         .alias = alias,
+        .index_hint = index_hint,
     };
 }
 
@@ -105,6 +143,32 @@ fn parseFromList(allocator: std.mem.Allocator, text: []const u8) types.ParseErro
     return out.toOwnedSlice(allocator);
 }
 
+fn findMatchingCloseParen(text: []const u8) ?usize {
+    if (text.len == 0 or text[0] != '(') return null;
+
+    var depth: usize = 0;
+    var in_string = false;
+    for (text, 0..) |c, i| {
+        if (in_string) {
+            if (c == '\'') in_string = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_string = true;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
+}
+
 fn parseOrderBy(allocator: std.mem.Allocator, text: []const u8) types.ParseError![]const types.OrderTerm {
     const parts = try common.splitTopLevelComma(allocator, text);
     var out = std.ArrayList(types.OrderTerm).empty;
@@ -113,18 +177,28 @@ fn parseOrderBy(allocator: std.mem.Allocator, text: []const u8) types.ParseError
     for (parts) |part| {
         const term = std.mem.trim(u8, part, " \t\r\n");
         if (term.len == 0) return types.ParseError.InvalidSql;
-        const ordinal = std.fmt.parseInt(usize, term, 10) catch 0;
+        var descending = false;
+        var expr_text = term;
+        if (term.len > 5 and common.eqlIgnoreCase(term[term.len - 5 ..], " DESC")) {
+            descending = true;
+            expr_text = std.mem.trim(u8, term[0 .. term.len - 5], " \t\r\n");
+        } else if (term.len > 4 and common.eqlIgnoreCase(term[term.len - 4 ..], " ASC")) {
+            expr_text = std.mem.trim(u8, term[0 .. term.len - 4], " \t\r\n");
+        }
+        const ordinal = std.fmt.parseInt(usize, expr_text, 10) catch 0;
         if (ordinal > 0) {
             try out.append(allocator, .{
-                .expr = try allocator.dupe(u8, term),
+                .expr = try allocator.dupe(u8, expr_text),
                 .is_ordinal = true,
                 .ordinal = ordinal,
+                .descending = descending,
             });
         } else {
             try out.append(allocator, .{
-                .expr = try allocator.dupe(u8, term),
+                .expr = try allocator.dupe(u8, expr_text),
                 .is_ordinal = false,
                 .ordinal = 0,
+                .descending = descending,
             });
         }
     }
@@ -142,6 +216,8 @@ fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.P
     if (startsWithKeyword(after_select, "DISTINCT")) {
         distinct = true;
         projection_start = after_select_idx + "DISTINCT".len;
+    } else if (startsWithKeyword(after_select, "ALL")) {
+        projection_start = after_select_idx + "ALL".len;
     }
     if (findTopLevelKeyword(sql_text, "FROM")) |from_idx| {
         const proj_sql = std.mem.trim(u8, sql_text[projection_start..from_idx], " \t\r\n");

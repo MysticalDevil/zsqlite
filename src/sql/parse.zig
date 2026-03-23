@@ -13,6 +13,9 @@ pub fn parse(allocator: std.mem.Allocator, sql_raw: []const u8) types.ParseError
     if (common.startsWithIgnoreCase(sql_text, "CREATE INDEX ")) {
         return create_insert.parseCreateIndex(allocator, sql_text);
     }
+    if (common.startsWithIgnoreCase(sql_text, "CREATE UNIQUE INDEX ")) {
+        return create_insert.parseCreateIndex(allocator, sql_text);
+    }
     if (common.startsWithIgnoreCase(sql_text, "CREATE VIEW ")) {
         return create_insert.parseCreateView(allocator, sql_text);
     }
@@ -36,6 +39,9 @@ pub fn parse(allocator: std.mem.Allocator, sql_raw: []const u8) types.ParseError
     }
     if (common.startsWithIgnoreCase(sql_text, "UPDATE ")) {
         return create_insert.parseUpdate(allocator, sql_text);
+    }
+    if (common.startsWithIgnoreCase(sql_text, "DELETE FROM ")) {
+        return create_insert.parseDelete(allocator, sql_text);
     }
     if (common.startsWithIgnoreCase(sql_text, "DROP TABLE ")) {
         return create_insert.parseDropTable(allocator, sql_text);

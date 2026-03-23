@@ -77,7 +77,17 @@ const Parser = struct {
 
     fn parseNot(self: *Parser) ParseError!*types.Expr {
         if (self.matchKeyword("NOT")) {
-            const inner = try self.parseNot();
+            const saved_idx = self.idx;
+            const left = try self.parseAdd();
+            if (self.matchKeyword("BETWEEN")) {
+                const low = try self.parseAdd();
+                if (!self.matchKeyword("AND")) return ParseError.InvalidExpression;
+                const high = try self.parseAdd();
+                return self.makeBetween(left, low, high, true);
+            }
+            if (self.matchKeyword("IN")) return self.parseInList(left, true);
+            self.idx = saved_idx;
+            const inner = try self.parseCompare();
             return self.makeUnary(.not_op, inner);
         }
         return self.parseCompare();
@@ -157,6 +167,7 @@ const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) ParseError!*types.Expr {
+        if (self.matchKind(.plus)) return self.parseUnary();
         if (self.matchKind(.minus)) return self.makeUnary(.neg, try self.parseUnary());
         return self.parsePrimary();
     }
@@ -233,6 +244,20 @@ const Parser = struct {
                     return node;
                 }
 
+                if (eqlIgnoreCase(ident, "CAST")) {
+                    try self.consumeKind(.lparen);
+                    const cast_expr = try self.parseExpr();
+                    if (!self.matchKeyword("AS")) return ParseError.InvalidExpression;
+                    const type_tok = self.expectKind(.ident) catch return ParseError.InvalidExpression;
+                    try self.consumeKind(.rparen);
+                    const node = try self.allocator.create(types.Expr);
+                    node.* = .{ .cast_expr = .{
+                        .expr = cast_expr,
+                        .target_type = try self.allocator.dupe(u8, self.tokText(type_tok)),
+                    } };
+                    return node;
+                }
+
                 if (self.matchKind(.lparen)) {
                     return self.parseCall(ident);
                 }
@@ -268,6 +293,7 @@ const Parser = struct {
 
         if (self.matchKeyword("DISTINCT")) {
             distinct = true;
+        } else if (self.matchKeyword("ALL")) {
         }
 
         if (self.matchKind(.star)) {
