@@ -129,3 +129,83 @@ test "compound query with in lists resolves columns per arm" {
 
     try std.testing.expectEqual(@as(usize, 0), rows.rows.items.len);
 }
+
+test "uncorrelated scalar subquery executes once per statement" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(a, b)");
+    var i: i64 = 0;
+    while (i < 50) : (i += 1) {
+        try db.exec("INSERT INTO t1 VALUES (1, 2)");
+    }
+
+    db.resetMetrics();
+    var rows = try db.query(
+        allocator,
+        "SELECT (SELECT avg(b) FROM t1) FROM t1",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 50), rows.rows.items.len);
+    const m = db.metrics();
+    try std.testing.expectEqual(@as(usize, 1), m.subquery_exec_calls);
+    try std.testing.expect(m.subquery_cache_hits >= 49);
+}
+
+test "uncorrelated exists subquery executes once per statement" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(a, b)");
+    var i: i64 = 1;
+    while (i <= 30) : (i += 1) {
+        const stmt = try std.fmt.allocPrint(allocator, "INSERT INTO t1 VALUES ({d}, {d})", .{ i, i });
+        defer allocator.free(stmt);
+        try db.exec(stmt);
+    }
+
+    db.resetMetrics();
+    var rows = try db.query(
+        allocator,
+        "SELECT a FROM t1 WHERE EXISTS(SELECT 1 FROM t1 WHERE b > 0)",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 30), rows.rows.items.len);
+    const m = db.metrics();
+    try std.testing.expectEqual(@as(usize, 1), m.subquery_exec_calls);
+    try std.testing.expect(m.subquery_cache_hits >= 29);
+}
+
+test "where OR short-circuits subquery evaluation" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(a, b)");
+    try db.exec("INSERT INTO t1 VALUES (1, 10)");
+    try db.exec("INSERT INTO t1 VALUES (2, 20)");
+
+    db.resetMetrics();
+    var rows = try db.query(
+        allocator,
+        "SELECT a FROM t1 WHERE 1=1 OR EXISTS(SELECT 1 FROM t1 WHERE b > 100)",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    const m = db.metrics();
+    try std.testing.expectEqual(@as(usize, 0), m.subquery_exec_calls);
+}
