@@ -95,6 +95,26 @@ test "parser splits complex compound arms" {
     try std.testing.expect(std.mem.indexOf(u8, stmt.compound_select.arms[1], "UNION") == null);
 }
 
+test "parser handles trigger timing and event variants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const before_insert = try sql.parse(arena.allocator(), "CREATE TRIGGER tr_before BEFORE INSERT ON t1 BEGIN SELECT 1; END");
+    try std.testing.expect(before_insert == .create_trigger);
+    try std.testing.expectEqual(sql.TriggerTiming.before, before_insert.create_trigger.timing);
+    try std.testing.expectEqual(sql.TriggerEvent.insert, before_insert.create_trigger.event);
+
+    const after_delete = try sql.parse(arena.allocator(), "CREATE TRIGGER tr_after AFTER DELETE ON t1 BEGIN SELECT 1; END");
+    try std.testing.expect(after_delete == .create_trigger);
+    try std.testing.expectEqual(sql.TriggerTiming.after, after_delete.create_trigger.timing);
+    try std.testing.expectEqual(sql.TriggerEvent.delete, after_delete.create_trigger.event);
+
+    const plain_update = try sql.parse(arena.allocator(), "CREATE TRIGGER tr_plain UPDATE ON t1 BEGIN SELECT 1; END");
+    try std.testing.expect(plain_update == .create_trigger);
+    try std.testing.expectEqual(sql.TriggerTiming.none, plain_update.create_trigger.timing);
+    try std.testing.expectEqual(sql.TriggerEvent.update, plain_update.create_trigger.event);
+}
+
 test "compound query with in lists resolves columns per arm" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
@@ -357,4 +377,37 @@ test "replace overwrites existing primary key row" {
     try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
     try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
     try std.testing.expect(rows.rows.items[0][1].eql(.{ .text = "replace" }));
+}
+
+test "create and drop trigger schema objects" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("CREATE TRIGGER tr1 UPDATE ON t1 BEGIN SELECT 1; END");
+    try std.testing.expectError(engine_mod.Error.TableAlreadyExists, db.exec("CREATE TRIGGER tr1 UPDATE ON t1 BEGIN SELECT 1; END"));
+    try db.exec("DROP TRIGGER tr1");
+    try std.testing.expectError(engine_mod.Error.UnknownTable, db.exec("DROP TRIGGER tr1"));
+}
+
+test "drop table removes attached triggers" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("CREATE TRIGGER tr_before BEFORE INSERT ON t1 BEGIN SELECT 1; END");
+    try db.exec("CREATE TRIGGER tr_after AFTER DELETE ON t1 BEGIN SELECT 1; END");
+    try db.exec("CREATE TRIGGER tr_plain UPDATE ON t1 BEGIN SELECT 1; END");
+    try db.exec("DROP TABLE t1");
+    try std.testing.expectError(engine_mod.Error.UnknownTable, db.exec("DROP TRIGGER tr_before"));
+    try std.testing.expectError(engine_mod.Error.UnknownTable, db.exec("DROP TRIGGER tr_after"));
+    try std.testing.expectError(engine_mod.Error.UnknownTable, db.exec("DROP TRIGGER tr_plain"));
 }
