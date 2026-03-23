@@ -4,6 +4,7 @@ pub const ParseError = error{ InvalidSql, UnsupportedSql, InvalidLiteral, OutOfM
 
 pub const Statement = union(enum) {
     create_table: CreateTable,
+    create_index: CreateIndex,
     insert: Insert,
     select: Select,
     compound_select: CompoundSelect,
@@ -12,6 +13,11 @@ pub const Statement = union(enum) {
 pub const CreateTable = struct {
     table_name: []const u8,
     columns: []const []const u8,
+};
+
+pub const CreateIndex = struct {
+    index_name: []const u8,
+    table_name: []const u8,
 };
 
 pub const Insert = struct {

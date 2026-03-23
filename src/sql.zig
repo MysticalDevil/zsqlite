@@ -3,6 +3,7 @@ const types = @import("sql/types.zig");
 pub const ParseError = types.ParseError;
 pub const Statement = types.Statement;
 pub const CreateTable = types.CreateTable;
+pub const CreateIndex = types.CreateIndex;
 pub const Insert = types.Insert;
 pub const Select = types.Select;
 pub const CompoundSelect = types.CompoundSelect;

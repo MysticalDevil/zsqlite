@@ -32,6 +32,29 @@ pub fn parseCreate(allocator: std.mem.Allocator, sql_text: []const u8) types.Par
     } };
 }
 
+pub fn parseCreateIndex(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
+    const after_kw = sql_text["CREATE INDEX ".len..];
+    const on_idx = common.indexOfIgnoreCase(after_kw, " ON ") orelse return types.ParseError.InvalidSql;
+    const index_name = std.mem.trim(u8, after_kw[0..on_idx], " \t\r\n");
+    if (index_name.len == 0) return types.ParseError.InvalidSql;
+
+    const after_on = std.mem.trim(u8, after_kw[on_idx + " ON ".len ..], " \t\r\n");
+    const lparen = std.mem.indexOfScalar(u8, after_on, '(') orelse return types.ParseError.InvalidSql;
+    const rparen = std.mem.lastIndexOfScalar(u8, after_on, ')') orelse return types.ParseError.InvalidSql;
+    if (rparen <= lparen + 1) return types.ParseError.InvalidSql;
+
+    const table_name = std.mem.trim(u8, after_on[0..lparen], " \t\r\n");
+    if (table_name.len == 0) return types.ParseError.InvalidSql;
+
+    const cols = std.mem.trim(u8, after_on[lparen + 1 .. rparen], " \t\r\n");
+    if (cols.len == 0) return types.ParseError.InvalidSql;
+
+    return .{ .create_index = .{
+        .index_name = try allocator.dupe(u8, index_name),
+        .table_name = try allocator.dupe(u8, table_name),
+    } };
+}
+
 pub fn parseInsert(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
     const after_kw = sql_text["INSERT INTO ".len..];
     const values_pos = common.indexOfIgnoreCase(after_kw, " VALUES") orelse return types.ParseError.InvalidSql;

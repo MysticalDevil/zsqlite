@@ -10,6 +10,9 @@ pub fn parse(allocator: std.mem.Allocator, sql_raw: []const u8) types.ParseError
     if (common.startsWithIgnoreCase(sql_text, "CREATE TABLE ")) {
         return create_insert.parseCreate(allocator, sql_text);
     }
+    if (common.startsWithIgnoreCase(sql_text, "CREATE INDEX ")) {
+        return create_insert.parseCreateIndex(allocator, sql_text);
+    }
     if (common.startsWithIgnoreCase(sql_text, "INSERT INTO ")) {
         return create_insert.parseInsert(allocator, sql_text);
     }

@@ -54,6 +54,10 @@ pub const Engine = struct {
                 try self.handleCreate(create);
                 return .{ .rows_affected = 0 };
             },
+            .create_index => {
+                // Indexes are metadata only in this in-memory engine; treat as successful no-op.
+                return .{ .rows_affected = 0 };
+            },
             .insert => |ins| {
                 try self.handleInsert(ins);
                 return .{ .rows_affected = 1 };
@@ -221,6 +225,127 @@ pub const Engine = struct {
             if (source.table.rows.items.len == 0) return result;
         }
 
+        var local_filters = try allocator.alloc(std.ArrayList(*expr_mod.Expr), sources.items.len);
+        defer {
+            for (local_filters) |*list| list.deinit(allocator);
+            allocator.free(local_filters);
+        }
+        for (local_filters) |*list| list.* = std.ArrayList(*expr_mod.Expr).empty;
+
+        var all_conjuncts = std.ArrayList(*expr_mod.Expr).empty;
+        defer all_conjuncts.deinit(allocator);
+
+        var residual_filters = std.ArrayList(*expr_mod.Expr).empty;
+        defer residual_filters.deinit(allocator);
+
+        if (where_expr) |w| {
+            var conjuncts = std.ArrayList(*expr_mod.Expr).empty;
+            defer conjuncts.deinit(allocator);
+            try collectAndConjuncts(allocator, w, &conjuncts);
+            for (conjuncts.items) |conjunct| {
+                try all_conjuncts.append(allocator, conjunct);
+                const dep = try exprDependency(conjunct, sources.items);
+                if (dep.supported and dep.mask != 0 and @popCount(dep.mask) == 1) {
+                    const single_idx = @ctz(dep.mask);
+                    try local_filters[single_idx].append(allocator, conjunct);
+                }
+            }
+        }
+
+        var candidate_rows = try allocator.alloc(std.ArrayList(usize), sources.items.len);
+        defer {
+            for (candidate_rows) |*list| list.deinit(allocator);
+            allocator.free(candidate_rows);
+        }
+        for (candidate_rows) |*list| list.* = std.ArrayList(usize).empty;
+
+        for (sources.items, 0..) |source, i| {
+            if (local_filters[i].items.len == 0) {
+                for (source.table.rows.items, 0..) |_, row_idx| {
+                    try candidate_rows[i].append(allocator, row_idx);
+                }
+            } else {
+                for (source.table.rows.items, 0..) |row, row_idx| {
+                    var local_ctx = EvalCtx{
+                        .table = source.table,
+                        .table_name = source.table_name,
+                        .alias = source.alias,
+                        .row = row,
+                        .parent = parent_ctx,
+                    };
+                    var keep = true;
+                    for (local_filters[i].items) |filter_expr| {
+                        const cond_val = try self.evalExpr(allocator, filter_expr, &local_ctx);
+                        if (!ops.toSqlBool(cond_val)) {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    if (keep) {
+                        try candidate_rows[i].append(allocator, row_idx);
+                    }
+                }
+            }
+            if (candidate_rows[i].items.len == 0) return result;
+        }
+
+        const source_lengths = try allocator.alloc(usize, sources.items.len);
+        defer allocator.free(source_lengths);
+        for (candidate_rows, 0..) |rows_for_source, i| {
+            source_lengths[i] = rows_for_source.items.len;
+        }
+
+        const iter_order = try allocator.alloc(usize, sources.items.len);
+        defer allocator.free(iter_order);
+        const source_to_iter_pos = try allocator.alloc(usize, sources.items.len);
+        defer allocator.free(source_to_iter_pos);
+        for (iter_order, 0..) |*slot, i| slot.* = i;
+
+        var i_sort: usize = 1;
+        while (i_sort < iter_order.len) : (i_sort += 1) {
+            const key = iter_order[i_sort];
+            var j = i_sort;
+            while (j > 0) {
+                const prev = iter_order[j - 1];
+                const prev_filters = local_filters[prev].items.len;
+                const key_filters = local_filters[key].items.len;
+                const prev_len = source_lengths[prev];
+                const key_len = source_lengths[key];
+                const should_move = (key_filters > prev_filters) or
+                    (key_filters == prev_filters and key_len < prev_len) or
+                    (key_filters == prev_filters and key_len == prev_len and key < prev);
+                if (!should_move) break;
+                iter_order[j] = prev;
+                j -= 1;
+            }
+            iter_order[j] = key;
+        }
+        for (iter_order, 0..) |src_idx, pos| {
+            source_to_iter_pos[src_idx] = pos;
+        }
+
+        var depth_filters = try allocator.alloc(std.ArrayList(*expr_mod.Expr), sources.items.len);
+        defer {
+            for (depth_filters) |*list| list.deinit(allocator);
+            allocator.free(depth_filters);
+        }
+        for (depth_filters) |*list| list.* = std.ArrayList(*expr_mod.Expr).empty;
+
+        for (all_conjuncts.items) |conjunct| {
+            const dep = try exprDependency(conjunct, sources.items);
+            if (!dep.supported or dep.mask == 0) {
+                try residual_filters.append(allocator, conjunct);
+                continue;
+            }
+            var max_pos: usize = 0;
+            for (sources.items, 0..) |_, src_idx| {
+                if ((dep.mask & (@as(u64, 1) << @intCast(src_idx))) != 0) {
+                    max_pos = @max(max_pos, source_to_iter_pos[src_idx]);
+                }
+            }
+            try depth_filters[max_pos].append(allocator, conjunct);
+        }
+
         const idxs = try allocator.alloc(usize, sources.items.len);
         defer allocator.free(idxs);
         @memset(idxs, 0);
@@ -235,17 +360,40 @@ pub const Engine = struct {
                     .table = source.table,
                     .table_name = source.table_name,
                     .alias = source.alias,
-                    .row = source.table.rows.items[idxs[i]],
+                    .row = source.table.rows.items[candidate_rows[i].items[idxs[i]]],
                     .parent = parent,
                 };
             }
             const ctx = &ctx_chain[sources.items.len - 1];
 
-            if (where_expr) |w| {
-                const cond_val = try self.evalExpr(allocator, w, ctx);
-                const cond = ops.toSqlBool(cond_val);
-                if (!cond) {
-                    if (!advanceRowIndices(sources.items, idxs)) break;
+            var failed_depth: ?usize = null;
+            var depth: usize = 0;
+            while (depth < depth_filters.len and failed_depth == null) : (depth += 1) {
+                for (depth_filters[depth].items) |filter_expr| {
+                    const cond_val = try self.evalExpr(allocator, filter_expr, ctx);
+                    if (!ops.toSqlBool(cond_val)) {
+                        failed_depth = depth;
+                        break;
+                    }
+                }
+            }
+
+            if (failed_depth) |d| {
+                if (!advanceRowIndicesFromIterDepth(source_lengths, idxs, iter_order, d)) break;
+                continue;
+            }
+
+            if (residual_filters.items.len > 0) {
+                var residual_ok = true;
+                for (residual_filters.items) |filter_expr| {
+                    const cond_val = try self.evalExpr(allocator, filter_expr, ctx);
+                    if (!ops.toSqlBool(cond_val)) {
+                        residual_ok = false;
+                        break;
+                    }
+                }
+                if (!residual_ok) {
+                    if (!advanceRowIndicesFromIterDepth(source_lengths, idxs, iter_order, iter_order.len - 1)) break;
                     continue;
                 }
             }
@@ -306,11 +454,11 @@ pub const Engine = struct {
             }
 
             try rows.append(allocator, .{ .values = out_row, .keys = keys });
-            if (!advanceRowIndices(sources.items, idxs)) break;
+            if (!advanceRowIndicesFromIterDepth(source_lengths, idxs, iter_order, iter_order.len - 1)) break;
         }
 
         if (sel.order_by.len > 0) {
-            std.sort.insertion(SortRow, rows.items, {}, sortRowLessThan);
+            std.sort.heap(SortRow, rows.items, {}, sortRowLessThan);
         }
 
         for (rows.items) |entry| {
@@ -420,7 +568,7 @@ pub const Engine = struct {
                 try rows.append(allocator, .{ .values = row, .keys = keys });
             }
 
-            std.sort.insertion(SortRow, rows.items, {}, sortRowLessThan);
+            std.sort.heap(SortRow, rows.items, {}, sortRowLessThan);
             out.rows.clearRetainingCapacity();
             for (rows.items) |entry| {
                 try out.rows.append(allocator, entry.values);
@@ -724,14 +872,141 @@ fn findQualifiedSourceIndex(sources: anytype, qualifier: []const u8) ?usize {
     return found;
 }
 
-fn advanceRowIndices(sources: anytype, idxs: []usize) bool {
+const ExprDependency = struct {
+    supported: bool,
+    mask: u64,
+};
+
+fn collectAndConjuncts(
+    allocator: std.mem.Allocator,
+    node: *expr_mod.Expr,
+    out: *std.ArrayList(*expr_mod.Expr),
+) Error!void {
+    switch (node.*) {
+        .binary => |b| {
+            if (b.op == .and_op) {
+                try collectAndConjuncts(allocator, b.left, out);
+                try collectAndConjuncts(allocator, b.right, out);
+                return;
+            }
+        },
+        else => {},
+    }
+    try out.append(allocator, node);
+}
+
+fn exprDependency(node: *expr_mod.Expr, sources: anytype) Error!ExprDependency {
+    return switch (node.*) {
+        .literal => .{ .supported = true, .mask = 0 },
+        .ident => |id| .{ .supported = true, .mask = @as(u64, 1) << @intCast(try resolveIdentifierSourceIndex(sources, id.qualifier, id.name)) },
+        .unary => |u| try exprDependency(u.expr, sources),
+        .binary => |b| combineDependency(try exprDependency(b.left, sources), try exprDependency(b.right, sources)),
+        .between => |b| combineDependency(
+            combineDependency(try exprDependency(b.target, sources), try exprDependency(b.low, sources)),
+            try exprDependency(b.high, sources),
+        ),
+        .is_null => |n| try exprDependency(n.target, sources),
+        .in_list => |n| blk: {
+            var dep = try exprDependency(n.target, sources);
+            for (n.items) |item| {
+                dep = combineDependency(dep, try exprDependency(item, sources));
+            }
+            break :blk dep;
+        },
+        .call => |c| blk: {
+            var dep = ExprDependency{ .supported = true, .mask = 0 };
+            for (c.args) |arg| {
+                dep = combineDependency(dep, try exprDependency(arg, sources));
+            }
+            break :blk dep;
+        },
+        .case_expr => |c| blk: {
+            var dep = ExprDependency{ .supported = true, .mask = 0 };
+            if (c.base) |base| dep = combineDependency(dep, try exprDependency(base, sources));
+            for (c.whens) |w| {
+                dep = combineDependency(dep, try exprDependency(w.cond, sources));
+                dep = combineDependency(dep, try exprDependency(w.value, sources));
+            }
+            if (c.else_expr) |e| dep = combineDependency(dep, try exprDependency(e, sources));
+            break :blk dep;
+        },
+        .subquery, .exists_subquery => .{ .supported = false, .mask = 0 },
+    };
+}
+
+fn combineDependency(a: ExprDependency, b: ExprDependency) ExprDependency {
+    if (!a.supported or !b.supported) return .{ .supported = false, .mask = 0 };
+    return .{ .supported = true, .mask = a.mask | b.mask };
+}
+
+fn resolveIdentifierSourceIndex(sources: anytype, qualifier: ?[]const u8, name: []const u8) Error!usize {
+    if (qualifier) |q| {
+        const idx = findQualifiedSourceIndex(sources, q) orelse return Error.UnknownColumn;
+        if (vm.columnIndex(sources[idx].table.columns.items, name) == null) return Error.UnknownColumn;
+        return idx;
+    }
+
+    var found: ?usize = null;
+    for (sources, 0..) |source, i| {
+        if (vm.columnIndex(source.table.columns.items, name) != null) {
+            if (found != null) return Error.UnknownColumn;
+            found = i;
+        }
+    }
+    return found orelse Error.UnknownColumn;
+}
+
+fn advanceRowIndicesByLengths(lengths: []const usize, idxs: []usize) bool {
     if (idxs.len == 0) return false;
     var pos = idxs.len;
     while (pos > 0) {
         pos -= 1;
         idxs[pos] += 1;
-        if (idxs[pos] < sources[pos].table.rows.items.len) return true;
+        if (idxs[pos] < lengths[pos]) return true;
         idxs[pos] = 0;
+    }
+    return false;
+}
+
+fn advanceRowIndicesFromDepth(lengths: []const usize, idxs: []usize, depth: usize) bool {
+    if (idxs.len == 0) return false;
+    var pos = depth + 1;
+    while (pos > 0) {
+        pos -= 1;
+        idxs[pos] += 1;
+        if (idxs[pos] < lengths[pos]) {
+            var reset_pos = pos + 1;
+            while (reset_pos < idxs.len) : (reset_pos += 1) {
+                idxs[reset_pos] = 0;
+            }
+            return true;
+        }
+        idxs[pos] = 0;
+    }
+    return false;
+}
+
+fn advanceRowIndicesFromIterDepth(
+    lengths: []const usize,
+    idxs: []usize,
+    iter_order: []const usize,
+    iter_depth: usize,
+) bool {
+    if (idxs.len == 0) return false;
+    var pos = iter_depth + 1;
+    while (pos > 0) {
+        pos -= 1;
+        const src = iter_order[pos];
+        idxs[src] += 1;
+        if (idxs[src] < lengths[src]) {
+            var reset_pos = pos + 1;
+            while (reset_pos < iter_order.len) : (reset_pos += 1) {
+                const reset_src = iter_order[reset_pos];
+                idxs[reset_src] = 0;
+            }
+            return true;
+        }
+        idxs[src] = 0;
     }
     return false;
 }
