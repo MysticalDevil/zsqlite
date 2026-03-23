@@ -15,6 +15,7 @@ const DebugOptions = struct {
 };
 const QueryMeta = struct {
     label: ?[]const u8,
+    column_types: []const u8,
 };
 const StatementExpectation = enum { ok, err };
 const CompareDetails = struct {
@@ -23,6 +24,11 @@ const CompareDetails = struct {
     actual_hash: ?[16]u8,
     expected_count: ?usize,
     expected_hash: ?[16]u8,
+};
+const PendingDirective = union(enum) {
+    none,
+    skipif: []const u8,
+    onlyif: []const u8,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -137,16 +143,35 @@ pub fn main(init: std.process.Init) !void {
     var fail: usize = 0;
     var fail_dump_count: usize = 0;
     var query_index: usize = 0;
+    var pending_directive: PendingDirective = .none;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "hash-threshold ")) continue;
+        if (std.mem.startsWith(u8, line, "skipif ")) {
+            pending_directive = .{ .skipif = std.mem.trim(u8, line["skipif ".len..], " \t\r") };
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "onlyif ")) {
+            pending_directive = .{ .onlyif = std.mem.trim(u8, line["onlyif ".len..], " \t\r") };
+            continue;
+        }
+        if (std.mem.eql(u8, line, "halt")) {
+            const should_skip = shouldSkipDirective(pending_directive);
+            pending_directive = .none;
+            if (should_skip) continue;
+            break;
+        }
 
         if (std.mem.startsWith(u8, line, "statement")) {
             const statement_expect = parseStatementExpectation(line);
             const sql = try readSqlBlock(allocator, &lines);
             defer allocator.free(sql);
+            const should_skip = shouldSkipDirective(pending_directive);
+            pending_directive = .none;
+            if (should_skip) continue;
             const result = db.exec(sql);
             if (result) |_| {
                 if (statement_expect == .ok) {
@@ -175,6 +200,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, line, "query")) {
             const meta = parseQueryMeta(line);
             query_index += 1;
+            const should_skip = shouldSkipDirective(pending_directive);
+            pending_directive = .none;
             if (opts.join_min != null or opts.join_max != null or opts.join_variant_min != null or opts.join_variant_max != null) {
                 const join_key = if (meta.label) |label| parseJoinKey(label) else null;
                 if (join_key == null) {
@@ -253,13 +280,16 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
             }
-            const sort_mode = parseSortMode(line);
-
             var query_block = try readQueryBlock(allocator, &lines);
             defer {
                 for (query_block.expected.items) |item| allocator.free(item);
                 query_block.expected.deinit(allocator);
             }
+            if (should_skip) {
+                allocator.free(query_block.sql);
+                continue;
+            }
+            const sort_mode = parseSortMode(line);
             if (opts.trace_query) {
                 if (meta.label) |label| {
                     std.debug.print("query#{d} label={s}\n", .{ query_index, label });
@@ -274,7 +304,7 @@ pub fn main(init: std.process.Init) !void {
             var rows = db.query(allocator, sql);
             if (rows) |*rs| {
                 defer rs.deinit();
-                const details = try compareResult(allocator, rs, sort_mode, query_block.expected.items);
+                const details = try compareResult(allocator, rs, sort_mode, meta.column_types, query_block.expected.items);
                 if (details.ok) {
                     pass += 1;
                 } else {
@@ -331,12 +361,12 @@ fn parseStatementExpectation(header: []const u8) StatementExpectation {
 
 fn parseQueryMeta(header: []const u8) QueryMeta {
     var it = std.mem.tokenizeScalar(u8, header, ' ');
-    const first = it.next() orelse return .{ .label = null };
-    if (!std.mem.eql(u8, first, "query")) return .{ .label = null };
-    if (it.next() == null) return .{ .label = null };
-    if (it.next() == null) return .{ .label = null };
+    const first = it.next() orelse return .{ .label = null, .column_types = "" };
+    if (!std.mem.eql(u8, first, "query")) return .{ .label = null, .column_types = "" };
+    const column_types = it.next() orelse return .{ .label = null, .column_types = "" };
+    if (it.next() == null) return .{ .label = null, .column_types = column_types };
     const label = it.next();
-    return .{ .label = label };
+    return .{ .label = label, .column_types = column_types };
 }
 
 const JoinKey = struct {
@@ -424,11 +454,12 @@ fn compareResult(
     allocator: std.mem.Allocator,
     rs: *const zsqlite.RowSet,
     sort_mode: SortMode,
+    column_types: []const u8,
     expected: []const []const u8,
 ) !CompareDetails {
     const hash_mode = expected.len == 1 and std.mem.indexOf(u8, expected[0], "values hashing to ") != null;
     if (hash_mode and sort_mode == .rowsort) {
-        return compareRowsortHashFast(allocator, rs, expected[0]);
+        return compareRowsortHashFast(allocator, rs, column_types, expected[0]);
     }
 
     var tokens = std.ArrayList([]const u8).empty;
@@ -450,7 +481,7 @@ fn compareResult(
         for (row, 0..) |v, i| {
             if (i != 0) try row_buf.append(allocator, '\x1f');
             const start = row_buf.items.len;
-            try appendValueString(&row_buf, allocator, v);
+            try appendValueString(&row_buf, allocator, v, columnTypeAt(column_types, i));
             try tokens.append(allocator, try allocator.dupe(u8, row_buf.items[start..]));
         }
 
@@ -475,15 +506,16 @@ fn compareResult(
                 try row_tokens.append(allocator, try allocator.dupe(u8, tok));
             }
         }
-        return compareExpected(allocator, row_tokens.items, expected);
+        return compareExpected(allocator, row_tokens.items, column_types, expected);
     }
 
-    return compareExpected(allocator, tokens.items, expected);
+    return compareExpected(allocator, tokens.items, column_types, expected);
 }
 
 fn compareRowsortHashFast(
     allocator: std.mem.Allocator,
     rs: *const zsqlite.RowSet,
+    column_types: []const u8,
     expected_line: []const u8,
 ) !CompareDetails {
     const parsed = parseExpectedHashLine(expected_line) orelse {
@@ -507,7 +539,7 @@ fn compareRowsortHashFast(
         defer row_buf.deinit(allocator);
         for (row, 0..) |v, i| {
             if (i != 0) try row_buf.append(allocator, '\x1f');
-            try appendValueString(&row_buf, allocator, v);
+            try appendValueString(&row_buf, allocator, v, columnTypeAt(column_types, i));
         }
         try row_strings.append(allocator, try row_buf.toOwnedSlice(allocator));
     }
@@ -534,6 +566,7 @@ fn compareRowsortHashFast(
 fn compareExpected(
     _: std.mem.Allocator,
     tokens: []const []const u8,
+    column_types: []const u8,
     expected: []const []const u8,
 ) !CompareDetails {
     const hash_mode = expected.len == 1 and std.mem.indexOf(u8, expected[0], "values hashing to ") != null;
@@ -566,8 +599,8 @@ fn compareExpected(
             .expected_hash = null,
         };
     }
-    for (tokens, expected) |actual, exp| {
-        if (!std.mem.eql(u8, actual, exp)) {
+    for (tokens, expected, 0..) |actual, exp, idx| {
+        if (!tokensEqualForType(actual, exp, columnTypeAt(column_types, idx))) {
             return .{
                 .ok = false,
                 .actual_count = tokens.len,
@@ -584,6 +617,15 @@ fn compareExpected(
         .expected_count = expected.len,
         .expected_hash = null,
     };
+}
+
+fn tokensEqualForType(actual: []const u8, expected: []const u8, col_type: u8) bool {
+    if (col_type != 'R') return std.mem.eql(u8, actual, expected);
+    const actual_num = std.fmt.parseFloat(f64, actual) catch return std.mem.eql(u8, actual, expected);
+    const expected_num = std.fmt.parseFloat(f64, expected) catch return std.mem.eql(u8, actual, expected);
+    const diff = @abs(actual_num - expected_num);
+    const scale = @max(@abs(actual_num), @abs(expected_num));
+    return diff <= 0.0005 or diff <= scale * 1e-12;
 }
 
 const ExpectedHash = struct {
@@ -654,7 +696,7 @@ fn dumpActualSample(
         defer row_buf.deinit(allocator);
         for (row, 0..) |v, i| {
             if (i != 0) try row_buf.append(allocator, '\x1f');
-            try appendValueString(&row_buf, allocator, v);
+            try appendValueString(&row_buf, allocator, v, 0);
         }
         try row_strings.append(allocator, try row_buf.toOwnedSlice(allocator));
     }
@@ -680,22 +722,60 @@ fn valueToOwnedString(allocator: std.mem.Allocator, value: zsqlite.Value) ![]con
     };
 }
 
-fn appendValueString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: zsqlite.Value) !void {
+fn appendValueString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: zsqlite.Value, col_type: u8) !void {
     switch (value) {
         .null => try buf.appendSlice(allocator, "NULL"),
-        .integer => |v| {
-            var scratch: [64]u8 = undefined;
-            const text = try std.fmt.bufPrint(&scratch, "{d}", .{v});
-            try buf.appendSlice(allocator, text);
+        .integer => |v| switch (col_type) {
+            'R' => {
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d:.3}", .{@as(f64, @floatFromInt(v))});
+                try buf.appendSlice(allocator, text);
+            },
+            else => {
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d}", .{v});
+                try buf.appendSlice(allocator, text);
+            },
         },
-        .real => |v| {
-            var scratch: [64]u8 = undefined;
-            const text = try std.fmt.bufPrint(&scratch, "{d}", .{v});
-            try buf.appendSlice(allocator, text);
+        .real => |v| switch (col_type) {
+            'I' => {
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d}", .{@as(i64, @intFromFloat(v))});
+                try buf.appendSlice(allocator, text);
+            },
+            'R' => {
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d:.3}", .{v});
+                try buf.appendSlice(allocator, text);
+            },
+            else => {
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d}", .{v});
+                try buf.appendSlice(allocator, text);
+            },
         },
-        .text => |v| try buf.appendSlice(allocator, v),
+        .text => |v| switch (col_type) {
+            'I' => {
+                const int_value = std.fmt.parseInt(i64, v, 10) catch 0;
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d}", .{int_value});
+                try buf.appendSlice(allocator, text);
+            },
+            'R' => {
+                const real_value = std.fmt.parseFloat(f64, v) catch 0;
+                var scratch: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&scratch, "{d:.3}", .{real_value});
+                try buf.appendSlice(allocator, text);
+            },
+            else => try buf.appendSlice(allocator, v),
+        },
         .blob => try buf.appendSlice(allocator, "BLOB"),
     }
+}
+
+fn columnTypeAt(column_types: []const u8, idx: usize) u8 {
+    if (column_types.len == 0) return 0;
+    return column_types[idx % column_types.len];
 }
 
 fn hashRowTokens(hasher: *std.crypto.hash.Md5, row_text: []const u8) usize {
@@ -717,4 +797,16 @@ fn hashRowTokens(hasher: *std.crypto.hash.Md5, row_text: []const u8) usize {
 
 fn lessString(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
+}
+
+fn shouldSkipDirective(pending: PendingDirective) bool {
+    return switch (pending) {
+        .none => false,
+        .skipif => |target| backendMatches(target),
+        .onlyif => |target| !backendMatches(target),
+    };
+}
+
+fn backendMatches(target: []const u8) bool {
+    return std.mem.eql(u8, target, "sqlite") or std.mem.eql(u8, target, "zsqlite");
 }
