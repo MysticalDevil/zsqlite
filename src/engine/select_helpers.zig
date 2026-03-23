@@ -63,6 +63,7 @@ pub fn exprDependency(
         ),
         .is_null => |n| try exprDependency(n.target, sources, eqlIgnoreCase),
         .in_list => |n| blk: {
+            if (n.subquery != null) break :blk .{ .supported = false, .mask = 0 };
             var dep = try exprDependency(n.target, sources, eqlIgnoreCase);
             for (n.items) |item| {
                 dep = combineDependency(dep, try exprDependency(item, sources, eqlIgnoreCase));

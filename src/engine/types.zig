@@ -25,12 +25,15 @@ pub const RowSet = struct {
 pub const Table = struct {
     name: []const u8,
     columns: std.ArrayList([]const u8),
+    integer_affinity: std.ArrayList(bool),
     rows: std.ArrayList([]Value),
+    primary_key_col: ?usize,
 
     pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         for (self.columns.items) |c| allocator.free(c);
         self.columns.deinit(allocator);
+        self.integer_affinity.deinit(allocator);
         for (self.rows.items) |row| {
             for (row) |v| switch (v) {
                 .text => |t| allocator.free(t),

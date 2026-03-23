@@ -76,7 +76,10 @@ fn parseFromItem(allocator: std.mem.Allocator, text: []const u8) types.ParseErro
 
     var alias: ?[]const u8 = null;
     if (it.next()) |second| {
-        if (common.eqlIgnoreCase(second, "AS")) {
+        if (common.eqlIgnoreCase(second, "NOT")) {
+            const third = it.next() orelse return types.ParseError.InvalidSql;
+            if (!common.eqlIgnoreCase(third, "INDEXED")) return types.ParseError.InvalidSql;
+        } else if (common.eqlIgnoreCase(second, "AS")) {
             const alias_name = it.next() orelse return types.ParseError.InvalidSql;
             alias = try allocator.dupe(u8, alias_name);
         } else {
@@ -130,41 +133,80 @@ fn parseOrderBy(allocator: std.mem.Allocator, text: []const u8) types.ParseError
 }
 
 fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
-    const from_idx = findTopLevelKeyword(sql_text, "FROM") orelse return types.ParseError.InvalidSql;
-
     const select_pos = findTopLevelKeyword(sql_text, "SELECT") orelse return types.ParseError.InvalidSql;
     if (select_pos != 0) return types.ParseError.InvalidSql;
-    const proj_sql = std.mem.trim(u8, sql_text["SELECT".len..from_idx], " \t\r\n");
+    var distinct = false;
+    var projection_start = "SELECT".len;
+    const after_select_idx = skipSpaces(sql_text, "SELECT".len);
+    const after_select = sql_text[after_select_idx..];
+    if (startsWithKeyword(after_select, "DISTINCT")) {
+        distinct = true;
+        projection_start = after_select_idx + "DISTINCT".len;
+    }
+    if (findTopLevelKeyword(sql_text, "FROM")) |from_idx| {
+        const proj_sql = std.mem.trim(u8, sql_text[projection_start..from_idx], " \t\r\n");
+        if (proj_sql.len == 0) return types.ParseError.InvalidSql;
+
+        const after_from_start = skipSpaces(sql_text, from_idx + "FROM".len);
+        const after_from = sql_text[after_from_start..];
+        const where_idx_rel = findTopLevelKeyword(after_from, "WHERE");
+        const order_idx_rel = findTopLevelOrderBy(after_from);
+
+        var from_end = after_from.len;
+        if (where_idx_rel) |idx| from_end = @min(from_end, idx);
+        if (order_idx_rel) |idx| from_end = @min(from_end, idx);
+
+        const from_part = std.mem.trim(u8, after_from[0..from_end], " \t\r\n");
+        if (from_part.len == 0) return types.ParseError.InvalidSql;
+        const from_list = try parseFromList(allocator, from_part);
+
+        const where_expr = if (where_idx_rel) |widx| blk: {
+            const start = widx + "WHERE".len;
+            const end = if (order_idx_rel) |oidx| oidx else after_from.len;
+            const text = std.mem.trim(u8, after_from[start..end], " \t\r\n");
+            if (text.len == 0) return types.ParseError.InvalidSql;
+            break :blk try allocator.dupe(u8, text);
+        } else null;
+
+        const order_by = if (order_idx_rel) |oidx|
+            try parseOrderBy(allocator, std.mem.trim(u8, after_from[oidx + "ORDER BY".len ..], " \t\r\n"))
+        else
+            try allocator.alloc(types.OrderTerm, 0);
+
+        return .{ .select = .{
+            .distinct = distinct,
+            .from = from_list,
+            .projections = try common.splitTopLevelComma(allocator, proj_sql),
+            .where_expr = where_expr,
+            .order_by = order_by,
+        } };
+    }
+
+    const where_idx = findTopLevelKeyword(sql_text, "WHERE");
+    const order_idx = findTopLevelOrderBy(sql_text);
+    var proj_end = sql_text.len;
+    if (where_idx) |idx| proj_end = @min(proj_end, idx);
+    if (order_idx) |idx| proj_end = @min(proj_end, idx);
+
+    const proj_sql = std.mem.trim(u8, sql_text[projection_start..proj_end], " \t\r\n");
     if (proj_sql.len == 0) return types.ParseError.InvalidSql;
 
-    const after_from_start = skipSpaces(sql_text, from_idx + "FROM".len);
-    const after_from = sql_text[after_from_start..];
-    const where_idx_rel = findTopLevelKeyword(after_from, "WHERE");
-    const order_idx_rel = findTopLevelOrderBy(after_from);
-
-    var from_end = after_from.len;
-    if (where_idx_rel) |idx| from_end = @min(from_end, idx);
-    if (order_idx_rel) |idx| from_end = @min(from_end, idx);
-
-    const from_part = std.mem.trim(u8, after_from[0..from_end], " \t\r\n");
-    if (from_part.len == 0) return types.ParseError.InvalidSql;
-    const from_list = try parseFromList(allocator, from_part);
-
-    const where_expr = if (where_idx_rel) |widx| blk: {
+    const where_expr = if (where_idx) |widx| blk: {
         const start = widx + "WHERE".len;
-        const end = if (order_idx_rel) |oidx| oidx else after_from.len;
-        const text = std.mem.trim(u8, after_from[start..end], " \t\r\n");
+        const end = if (order_idx) |oidx| oidx else sql_text.len;
+        const text = std.mem.trim(u8, sql_text[start..end], " \t\r\n");
         if (text.len == 0) return types.ParseError.InvalidSql;
         break :blk try allocator.dupe(u8, text);
     } else null;
 
-    const order_by = if (order_idx_rel) |oidx|
-        try parseOrderBy(allocator, std.mem.trim(u8, after_from[oidx + "ORDER BY".len ..], " \t\r\n"))
+    const order_by = if (order_idx) |oidx|
+        try parseOrderBy(allocator, std.mem.trim(u8, sql_text[oidx + "ORDER BY".len ..], " \t\r\n"))
     else
         try allocator.alloc(types.OrderTerm, 0);
 
     return .{ .select = .{
-        .from = from_list,
+        .distinct = distinct,
+        .from = try allocator.alloc(types.FromItem, 0),
         .projections = try common.splitTopLevelComma(allocator, proj_sql),
         .where_expr = where_expr,
         .order_by = order_by,

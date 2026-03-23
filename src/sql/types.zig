@@ -5,7 +5,13 @@ pub const ParseError = error{ InvalidSql, UnsupportedSql, InvalidLiteral, OutOfM
 pub const Statement = union(enum) {
     create_table: CreateTable,
     create_index: CreateIndex,
+    create_view: CreateView,
     insert: Insert,
+    update: Update,
+    drop_table: DropObject,
+    drop_index: DropObject,
+    drop_view: DropObject,
+    reindex: Reindex,
     select: Select,
     compound_select: CompoundSelect,
 };
@@ -13,6 +19,8 @@ pub const Statement = union(enum) {
 pub const CreateTable = struct {
     table_name: []const u8,
     columns: []const []const u8,
+    integer_affinity: []const bool,
+    primary_key_col: ?usize,
 };
 
 pub const CreateIndex = struct {
@@ -20,10 +28,37 @@ pub const CreateIndex = struct {
     table_name: []const u8,
 };
 
+pub const CreateView = struct {
+    view_name: []const u8,
+    select_sql: []const u8,
+};
+
 pub const Insert = struct {
     table_name: []const u8,
     columns: ?[]const []const u8,
-    values: []const Value,
+    values: ?[]const Value,
+    select_sql: ?[]const u8,
+    or_replace: bool,
+};
+
+pub const Assignment = struct {
+    column_name: []const u8,
+    expr: []const u8,
+};
+
+pub const Update = struct {
+    table_name: []const u8,
+    assignments: []const Assignment,
+    where_expr: ?[]const u8,
+};
+
+pub const DropObject = struct {
+    object_name: []const u8,
+    if_exists: bool,
+};
+
+pub const Reindex = struct {
+    target_name: []const u8,
 };
 
 pub const OrderTerm = struct {
@@ -33,6 +68,7 @@ pub const OrderTerm = struct {
 };
 
 pub const Select = struct {
+    distinct: bool,
     from: []const FromItem,
     projections: []const []const u8,
     where_expr: ?[]const u8,

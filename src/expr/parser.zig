@@ -87,6 +87,9 @@ const Parser = struct {
         const left = try self.parseAdd();
 
         if (self.matchKeyword("NOT")) {
+            if (self.matchKeyword("NULL")) {
+                return self.makeIsNull(left, true);
+            }
             if (self.matchKeyword("BETWEEN")) {
                 const low = try self.parseAdd();
                 if (!self.matchKeyword("AND")) return ParseError.InvalidExpression;
@@ -207,6 +210,23 @@ const Parser = struct {
             .ident => {
                 self.idx += 1;
                 const ident = self.tokText(tok);
+                if (eqlIgnoreCase(ident, "x") or eqlIgnoreCase(ident, "X")) {
+                    if (self.peek()) |next_tok| {
+                        if (next_tok.kind == .string) {
+                            self.idx += 1;
+                            const text = self.tokText(next_tok);
+                            if (text.len < 2) return ParseError.InvalidExpression;
+                            const hex_text = text[1 .. text.len - 1];
+                            if (hex_text.len % 2 != 0) return ParseError.InvalidExpression;
+                            const blob = try self.allocator.alloc(u8, hex_text.len / 2);
+                            const decoded = std.fmt.hexToBytes(blob, hex_text) catch return ParseError.InvalidExpression;
+                            if (decoded.len != blob.len) return ParseError.InvalidExpression;
+                            const node = try self.allocator.create(types.Expr);
+                            node.* = .{ .literal = .{ .blob = blob } };
+                            return node;
+                        }
+                    }
+                }
                 if (eqlIgnoreCase(ident, "NULL")) {
                     const node = try self.allocator.create(types.Expr);
                     node.* = .{ .literal = .null };
@@ -244,8 +264,14 @@ const Parser = struct {
         var args = std.ArrayList(*types.Expr).empty;
         defer args.deinit(self.allocator);
         var star_arg = false;
+        var distinct = false;
+
+        if (self.matchKeyword("DISTINCT")) {
+            distinct = true;
+        }
 
         if (self.matchKind(.star)) {
+            if (distinct) return ParseError.InvalidExpression;
             star_arg = true;
             try self.consumeKind(.rparen);
         } else if (self.matchKind(.rparen)) {} else {
@@ -262,6 +288,7 @@ const Parser = struct {
             .name = try self.allocator.dupe(u8, name),
             .args = try args.toOwnedSlice(self.allocator),
             .star_arg = star_arg,
+            .distinct = distinct,
         } };
         return node;
     }
@@ -352,24 +379,47 @@ const Parser = struct {
     }
 
     fn parseInList(self: *Parser, target: *types.Expr, not_in: bool) ParseError!*types.Expr {
-        if (!self.matchKind(.lparen)) return ParseError.InvalidExpression;
+        var subquery: ?[]const u8 = null;
+        if (!self.matchKind(.lparen)) {
+            const tok = self.peek() orelse return ParseError.InvalidExpression;
+            if (tok.kind != .ident) return ParseError.InvalidExpression;
+            self.idx += 1;
+            subquery = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{self.tokText(tok)});
+            const node = try self.allocator.create(types.Expr);
+            node.* = .{ .in_list = .{
+                .target = target,
+                .items = try self.allocator.alloc(*types.Expr, 0),
+                .subquery = subquery,
+                .not_in = not_in,
+            } };
+            return node;
+        }
 
         var items = std.ArrayList(*types.Expr).empty;
         defer items.deinit(self.allocator);
 
-        const first = try self.parseOr();
-        try items.append(self.allocator, first);
-        while (self.matchKind(.comma)) {
-            const item = try self.parseOr();
-            try items.append(self.allocator, item);
-        }
+        if (self.peek()) |tok| {
+            if (tok.kind == .ident and eqlIgnoreCase(self.tokText(tok), "SELECT")) {
+                subquery = try self.captureSubqueryUntilRParen();
+            } else if (!self.matchKind(.rparen)) {
+                const first = try self.parseOr();
+                try items.append(self.allocator, first);
+                while (self.matchKind(.comma)) {
+                    const item = try self.parseOr();
+                    try items.append(self.allocator, item);
+                }
 
-        if (!self.matchKind(.rparen)) return ParseError.InvalidExpression;
+                if (!self.matchKind(.rparen)) return ParseError.InvalidExpression;
+            }
+        } else {
+            return ParseError.InvalidExpression;
+        }
 
         const node = try self.allocator.create(types.Expr);
         node.* = .{ .in_list = .{
             .target = target,
             .items = try items.toOwnedSlice(self.allocator),
+            .subquery = subquery,
             .not_in = not_in,
         } };
         return node;

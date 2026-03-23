@@ -36,6 +36,7 @@ pub const Call = struct {
     name: []const u8,
     args: []const *Expr,
     star_arg: bool,
+    distinct: bool,
 };
 
 pub const CaseWhen = struct {
@@ -57,6 +58,7 @@ pub const IsNull = struct {
 pub const InList = struct {
     target: *Expr,
     items: []const *Expr,
+    subquery: ?[]const u8,
     not_in: bool,
 };
 

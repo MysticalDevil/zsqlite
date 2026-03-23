@@ -112,13 +112,20 @@ pub fn compareValues(a: Value, b: Value) i8 {
 
 pub fn containsAggregateCall(node: *expr_mod.Expr) bool {
     return switch (node.*) {
-        .call => |c| eqlIgnoreCase(c.name, "count") or eqlIgnoreCase(c.name, "avg"),
+        .call => |c| eqlIgnoreCase(c.name, "count") or
+            eqlIgnoreCase(c.name, "avg") or
+            eqlIgnoreCase(c.name, "sum") or
+            eqlIgnoreCase(c.name, "total") or
+            eqlIgnoreCase(c.name, "min") or
+            eqlIgnoreCase(c.name, "max") or
+            eqlIgnoreCase(c.name, "group_concat"),
         .unary => |u| containsAggregateCall(u.expr),
         .binary => |b| containsAggregateCall(b.left) or containsAggregateCall(b.right),
         .between => |b| containsAggregateCall(b.target) or containsAggregateCall(b.low) or containsAggregateCall(b.high),
         .is_null => |n| containsAggregateCall(n.target),
         .in_list => |n| blk: {
             if (containsAggregateCall(n.target)) break :blk true;
+            if (n.subquery != null) break :blk false;
             for (n.items) |item| {
                 if (containsAggregateCall(item)) break :blk true;
             }
