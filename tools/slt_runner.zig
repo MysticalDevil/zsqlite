@@ -8,6 +8,8 @@ const DebugOptions = struct {
     no_label_only: bool,
     join_min: ?usize,
     join_max: ?usize,
+    join_variant_min: ?usize,
+    join_variant_max: ?usize,
     trace_query: bool,
     stop_on_fail: bool,
 };
@@ -41,6 +43,8 @@ pub fn main(init: std.process.Init) !void {
         .no_label_only = false,
         .join_min = null,
         .join_max = null,
+        .join_variant_min = null,
+        .join_variant_max = null,
         .trace_query = false,
         .stop_on_fail = false,
     };
@@ -84,6 +88,28 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
+        if (std.mem.eql(u8, arg, "--join-variant-min")) {
+            const value = args.next() orelse {
+                std.debug.print("missing value for --join-variant-min\n", .{});
+                return;
+            };
+            opts.join_variant_min = std.fmt.parseInt(usize, value, 10) catch {
+                std.debug.print("invalid --join-variant-min: {s}\n", .{value});
+                return;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--join-variant-max")) {
+            const value = args.next() orelse {
+                std.debug.print("missing value for --join-variant-max\n", .{});
+                return;
+            };
+            opts.join_variant_max = std.fmt.parseInt(usize, value, 10) catch {
+                std.debug.print("invalid --join-variant-max: {s}\n", .{value});
+                return;
+            };
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--stop-on-fail")) {
             opts.stop_on_fail = true;
             continue;
@@ -95,7 +121,12 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("unknown argument: {s}\n", .{arg});
         return;
     }
-    const ignore_statement_failures = opts.label_filter != null or opts.no_label_only or opts.join_min != null or opts.join_max != null;
+    const ignore_statement_failures = opts.label_filter != null or
+        opts.no_label_only or
+        opts.join_min != null or
+        opts.join_max != null or
+        opts.join_variant_min != null or
+        opts.join_variant_max != null;
     const content = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1024 * 1024 * 128));
     defer allocator.free(content);
 
@@ -144,9 +175,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, line, "query")) {
             const meta = parseQueryMeta(line);
             query_index += 1;
-            if (opts.join_min != null or opts.join_max != null) {
-                const join_num = if (meta.label) |label| parseJoinNumber(label) else null;
-                if (join_num == null) {
+            if (opts.join_min != null or opts.join_max != null or opts.join_variant_min != null or opts.join_variant_max != null) {
+                const join_key = if (meta.label) |label| parseJoinKey(label) else null;
+                if (join_key == null) {
                     var skipped_joinless = try readQueryBlock(allocator, &lines);
                     defer {
                         allocator.free(skipped_joinless.sql);
@@ -156,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
                 if (opts.join_min) |min_n| {
-                    if (join_num.? < min_n) {
+                    if (join_key.?.primary < min_n) {
                         var skipped_join_min = try readQueryBlock(allocator, &lines);
                         defer {
                             allocator.free(skipped_join_min.sql);
@@ -167,12 +198,36 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
                 if (opts.join_max) |max_n| {
-                    if (join_num.? > max_n) {
+                    if (join_key.?.primary > max_n) {
                         var skipped_join_max = try readQueryBlock(allocator, &lines);
                         defer {
                             allocator.free(skipped_join_max.sql);
                             for (skipped_join_max.expected.items) |item| allocator.free(item);
                             skipped_join_max.expected.deinit(allocator);
+                        }
+                        continue;
+                    }
+                }
+                if (opts.join_variant_min) |min_v| {
+                    const variant = join_key.?.variant orelse 0;
+                    if (variant < min_v) {
+                        var skipped_join_variant_min = try readQueryBlock(allocator, &lines);
+                        defer {
+                            allocator.free(skipped_join_variant_min.sql);
+                            for (skipped_join_variant_min.expected.items) |item| allocator.free(item);
+                            skipped_join_variant_min.expected.deinit(allocator);
+                        }
+                        continue;
+                    }
+                }
+                if (opts.join_variant_max) |max_v| {
+                    const variant = join_key.?.variant orelse 0;
+                    if (variant > max_v) {
+                        var skipped_join_variant_max = try readQueryBlock(allocator, &lines);
+                        defer {
+                            allocator.free(skipped_join_variant_max.sql);
+                            for (skipped_join_variant_max.expected.items) |item| allocator.free(item);
+                            skipped_join_variant_max.expected.deinit(allocator);
                         }
                         continue;
                     }
@@ -206,7 +261,11 @@ pub fn main(init: std.process.Init) !void {
                 query_block.expected.deinit(allocator);
             }
             if (opts.trace_query) {
-                std.debug.print("query#{d} label={any}\n", .{ query_index, meta.label });
+                if (meta.label) |label| {
+                    std.debug.print("query#{d} label={s}\n", .{ query_index, label });
+                } else {
+                    std.debug.print("query#{d} label=<none>\n", .{query_index});
+                }
             }
 
             const sql = query_block.sql;
@@ -280,11 +339,31 @@ fn parseQueryMeta(header: []const u8) QueryMeta {
     return .{ .label = label };
 }
 
-fn parseJoinNumber(label: []const u8) ?usize {
+const JoinKey = struct {
+    primary: usize,
+    variant: ?usize,
+};
+
+fn parseJoinKey(label: []const u8) ?JoinKey {
     if (!std.mem.startsWith(u8, label, "join")) return null;
-    const suffix = label["join".len..];
+    var suffix = label["join".len..];
     if (suffix.len == 0) return null;
-    return std.fmt.parseInt(usize, suffix, 10) catch null;
+    if (suffix[0] == '-') suffix = suffix[1..];
+    if (suffix.len == 0) return null;
+
+    var split = std.mem.splitScalar(u8, suffix, '-');
+    const first = split.next() orelse return null;
+    if (first.len == 0) return null;
+    const primary = std.fmt.parseInt(usize, first, 10) catch return null;
+    const second = split.next();
+    const variant = if (second) |s|
+        std.fmt.parseInt(usize, s, 10) catch return null
+    else
+        null;
+    return .{
+        .primary = primary,
+        .variant = variant,
+    };
 }
 
 fn readSqlBlock(allocator: std.mem.Allocator, lines: anytype) ![]u8 {
