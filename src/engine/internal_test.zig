@@ -209,3 +209,152 @@ test "where OR short-circuits subquery evaluation" {
     const m = db.metrics();
     try std.testing.expectEqual(@as(usize, 0), m.subquery_exec_calls);
 }
+
+test "empty IN list follows SQLite truth table" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(a)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+    try db.exec("INSERT INTO t1 VALUES (NULL)");
+
+    var rows = try db.query(
+        allocator,
+        "SELECT a IN (), a NOT IN () FROM t1 ORDER BY 1",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 0 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .integer = 1 }));
+    try std.testing.expect(rows.rows.items[1][0].eql(.{ .integer = 0 }));
+    try std.testing.expect(rows.rows.items[1][1].eql(.{ .integer = 1 }));
+}
+
+test "IN supports subquery and table-name shorthand" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+    try db.exec("INSERT INTO t1 VALUES (2)");
+
+    var rows = try db.query(
+        allocator,
+        "SELECT 1 IN t1, 3 IN (SELECT x FROM t1), NULL IN (SELECT x FROM t1)",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 1 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .integer = 0 }));
+    try std.testing.expect(rows.rows.items[0][2] == .null);
+}
+
+test "insert into select copies source rows" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE src(a)");
+    try db.exec("CREATE TABLE dst(a)");
+    try db.exec("INSERT INTO src VALUES (2)");
+    try db.exec("INSERT INTO src VALUES (3)");
+    try db.exec("INSERT INTO dst SELECT * FROM src");
+
+    var rows = try db.query(allocator, "SELECT a FROM dst ORDER BY 1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
+    try std.testing.expect(rows.rows.items[1][0].eql(.{ .integer = 3 }));
+}
+
+test "blob literal parses in expressions" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+
+    var rows = try db.query(allocator, "SELECT x'303132' IN ()");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 0 }));
+}
+
+test "update uses old row values and rightmost assignment wins" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x, y)");
+    try db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    try db.exec("UPDATE t1 SET x=10, x=x+2, y='b' WHERE x=1");
+
+    var rows = try db.query(allocator, "SELECT x, y FROM t1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 3 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .text = "b" }));
+}
+
+test "update without where touches all rows" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+    try db.exec("INSERT INTO t1 VALUES (2)");
+    try db.exec("UPDATE t1 SET x=7");
+
+    var rows = try db.query(allocator, "SELECT count(*) FROM t1 WHERE x=7");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
+}
+
+test "replace overwrites existing primary key row" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x INTEGER PRIMARY KEY, y)");
+    try db.exec("INSERT INTO t1 VALUES (2, 'insert')");
+    try db.exec("REPLACE INTO t1 VALUES (2, 'replace')");
+
+    var rows = try db.query(allocator, "SELECT x, y FROM t1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .text = "replace" }));
+}
