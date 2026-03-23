@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const slt_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
 
     const lib_mod = b.addModule("zsqlite", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -24,10 +25,18 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/slt_runner.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = slt_optimize,
             .link_libc = false,
             .imports = &.{
-                .{ .name = "zsqlite", .module = lib_mod },
+                .{
+                    .name = "zsqlite",
+                    .module = b.addModule("zsqlite_slt", .{
+                        .root_source_file = b.path("src/lib.zig"),
+                        .target = target,
+                        .optimize = slt_optimize,
+                        .link_libc = false,
+                    }),
+                },
             },
         }),
     });
