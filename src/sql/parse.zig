@@ -22,6 +22,9 @@ pub fn parse(allocator: std.mem.Allocator, sql_raw: []const u8) types.ParseError
     if (common.startsWithIgnoreCase(sql_text, "CREATE TEMPORARY VIEW ")) {
         return create_insert.parseCreateView(allocator, sql_text);
     }
+    if (common.startsWithIgnoreCase(sql_text, "CREATE TRIGGER ")) {
+        return create_insert.parseCreateTrigger(allocator, sql_text);
+    }
     if (common.startsWithIgnoreCase(sql_text, "INSERT INTO ")) {
         return create_insert.parseInsert(allocator, sql_text);
     }
@@ -39,6 +42,9 @@ pub fn parse(allocator: std.mem.Allocator, sql_raw: []const u8) types.ParseError
     }
     if (common.startsWithIgnoreCase(sql_text, "DROP INDEX ")) {
         return create_insert.parseDropIndex(allocator, sql_text);
+    }
+    if (common.startsWithIgnoreCase(sql_text, "DROP TRIGGER ")) {
+        return create_insert.parseDropTrigger(allocator, sql_text);
     }
     if (common.startsWithIgnoreCase(sql_text, "DROP VIEW ")) {
         return create_insert.parseDropView(allocator, sql_text);

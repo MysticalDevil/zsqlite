@@ -219,12 +219,65 @@ pub fn parseCreateView(allocator: std.mem.Allocator, sql_text: []const u8) types
     } };
 }
 
+pub fn parseCreateTrigger(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
+    const after_kw = std.mem.trim(u8, sql_text["CREATE TRIGGER ".len..], " \t\r\n");
+    const name_end = std.mem.indexOfAny(u8, after_kw, " \t\r\n") orelse return types.ParseError.InvalidSql;
+    const trigger_name = std.mem.trim(u8, after_kw[0..name_end], " \t\r\n");
+    if (trigger_name.len == 0) return types.ParseError.InvalidSql;
+
+    var rest = std.mem.trim(u8, after_kw[name_end..], " \t\r\n");
+    var timing: types.TriggerTiming = .none;
+    if (common.startsWithIgnoreCase(rest, "BEFORE ")) {
+        timing = .before;
+        rest = std.mem.trim(u8, rest["BEFORE ".len..], " \t\r\n");
+    } else if (common.startsWithIgnoreCase(rest, "AFTER ")) {
+        timing = .after;
+        rest = std.mem.trim(u8, rest["AFTER ".len..], " \t\r\n");
+    }
+
+    const event_end = std.mem.indexOfAny(u8, rest, " \t\r\n") orelse return types.ParseError.InvalidSql;
+    const event_text = std.mem.trim(u8, rest[0..event_end], " \t\r\n");
+    const event: types.TriggerEvent = if (common.eqlIgnoreCase(event_text, "INSERT"))
+        .insert
+    else if (common.eqlIgnoreCase(event_text, "UPDATE"))
+        .update
+    else if (common.eqlIgnoreCase(event_text, "DELETE"))
+        .delete
+    else
+        return types.ParseError.UnsupportedSql;
+
+    rest = std.mem.trim(u8, rest[event_end..], " \t\r\n");
+    if (!common.startsWithIgnoreCase(rest, "ON ")) return types.ParseError.InvalidSql;
+    rest = std.mem.trim(u8, rest["ON ".len..], " \t\r\n");
+
+    const begin_idx = common.indexOfIgnoreCase(rest, " BEGIN ") orelse return types.ParseError.InvalidSql;
+    const table_name = std.mem.trim(u8, rest[0..begin_idx], " \t\r\n");
+    if (table_name.len == 0) return types.ParseError.InvalidSql;
+
+    const body_and_end = std.mem.trim(u8, rest[begin_idx + " BEGIN ".len ..], " \t\r\n");
+    if (!common.endsWithIgnoreCase(body_and_end, " END")) return types.ParseError.InvalidSql;
+    const body_sql = std.mem.trim(u8, body_and_end[0 .. body_and_end.len - " END".len], " \t\r\n");
+    if (body_sql.len == 0) return types.ParseError.InvalidSql;
+
+    return .{ .create_trigger = .{
+        .trigger_name = try allocator.dupe(u8, trigger_name),
+        .table_name = try allocator.dupe(u8, table_name),
+        .timing = timing,
+        .event = event,
+        .body_sql = try allocator.dupe(u8, body_sql),
+    } };
+}
+
 pub fn parseDropTable(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
     return .{ .drop_table = try parseDropObject(allocator, sql_text["DROP TABLE ".len..]) };
 }
 
 pub fn parseDropIndex(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
     return .{ .drop_index = try parseDropObject(allocator, sql_text["DROP INDEX ".len..]) };
+}
+
+pub fn parseDropTrigger(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {
+    return .{ .drop_trigger = try parseDropObject(allocator, sql_text["DROP TRIGGER ".len..]) };
 }
 
 pub fn parseDropView(allocator: std.mem.Allocator, sql_text: []const u8) types.ParseError!types.Statement {

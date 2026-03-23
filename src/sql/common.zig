@@ -5,6 +5,11 @@ pub fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
     return eqlIgnoreCase(haystack[0..prefix.len], prefix);
 }
 
+pub fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (haystack.len < suffix.len) return false;
+    return eqlIgnoreCase(haystack[haystack.len - suffix.len ..], suffix);
+}
+
 pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ca, cb| {

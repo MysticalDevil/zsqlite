@@ -41,6 +41,20 @@ const ViewDef = struct {
     }
 };
 
+const TriggerDef = struct {
+    name: []const u8,
+    table_name: []const u8,
+    timing: sql.TriggerTiming,
+    event: sql.TriggerEvent,
+    body_sql: []const u8,
+
+    fn deinit(self: *TriggerDef, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.table_name);
+        allocator.free(self.body_sql);
+    }
+};
+
 pub const Error = error{
     OutOfMemory,
     TableAlreadyExists,
@@ -64,6 +78,7 @@ pub const Engine = struct {
     tables: std.StringHashMap(Table),
     views: std.StringHashMap(ViewDef),
     indexes: std.StringHashMap([]const u8),
+    triggers: std.StringHashMap(TriggerDef),
     metrics_data: QueryMetrics,
     metrics_enabled: bool,
 
@@ -73,6 +88,7 @@ pub const Engine = struct {
             .tables = std.StringHashMap(Table).init(allocator),
             .views = std.StringHashMap(ViewDef).init(allocator),
             .indexes = std.StringHashMap([]const u8).init(allocator),
+            .triggers = std.StringHashMap(TriggerDef).init(allocator),
             .metrics_data = .{},
             .metrics_enabled = false,
         };
@@ -101,6 +117,14 @@ pub const Engine = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.indexes.deinit();
+
+        var trigger_it = self.triggers.iterator();
+        while (trigger_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var trigger = entry.value_ptr.*;
+            trigger.deinit(self.allocator);
+        }
+        self.triggers.deinit();
     }
 
     pub fn exec(self: *Engine, sql_text: []const u8) Error!ExecResult {
@@ -120,6 +144,10 @@ pub const Engine = struct {
                 try self.handleCreateView(create_view);
                 return .{ .rows_affected = 0 };
             },
+            .create_trigger => |create_trigger| {
+                try self.handleCreateTrigger(create_trigger);
+                return .{ .rows_affected = 0 };
+            },
             .insert => |ins| {
                 try self.handleInsert(ins);
                 return .{ .rows_affected = 1 };
@@ -133,6 +161,10 @@ pub const Engine = struct {
             },
             .drop_index => |drop_index| {
                 try self.handleDropIndex(drop_index);
+                return .{ .rows_affected = 0 };
+            },
+            .drop_trigger => |drop_trigger| {
+                try self.handleDropTrigger(drop_trigger);
                 return .{ .rows_affected = 0 };
             },
             .drop_view => |drop_view| {
@@ -232,6 +264,21 @@ pub const Engine = struct {
             .name = try self.allocator.dupe(u8, create.view_name),
             .select_sql = try self.allocator.dupe(u8, create.select_sql),
             .columns = columns,
+        };
+    }
+
+    fn handleCreateTrigger(self: *Engine, create: sql.CreateTrigger) Error!void {
+        if (self.tables.getPtr(create.table_name) == null) return Error.UnknownTable;
+        const key = try self.allocator.dupe(u8, create.trigger_name);
+        errdefer self.allocator.free(key);
+        const gop = try self.triggers.getOrPut(key);
+        if (gop.found_existing) return Error.TableAlreadyExists;
+        gop.value_ptr.* = .{
+            .name = try self.allocator.dupe(u8, create.trigger_name),
+            .table_name = try self.allocator.dupe(u8, create.table_name),
+            .timing = create.timing,
+            .event = create.event,
+            .body_sql = try self.allocator.dupe(u8, create.body_sql),
         };
     }
 
@@ -410,6 +457,18 @@ pub const Engine = struct {
             for (index_names.items) |index_name| {
                 try self.handleDropIndex(.{ .object_name = index_name, .if_exists = false });
             }
+
+            var trigger_names = std.ArrayList([]const u8).empty;
+            defer trigger_names.deinit(self.allocator);
+            var trigger_it = self.triggers.iterator();
+            while (trigger_it.next()) |trigger_entry| {
+                if (std.mem.eql(u8, trigger_entry.value_ptr.table_name, drop_table.object_name)) {
+                    try trigger_names.append(self.allocator, trigger_entry.key_ptr.*);
+                }
+            }
+            for (trigger_names.items) |trigger_name| {
+                try self.handleDropTrigger(.{ .object_name = trigger_name, .if_exists = false });
+            }
             return;
         }
         if (drop_table.if_exists) return;
@@ -424,6 +483,18 @@ pub const Engine = struct {
             return;
         }
         if (drop_index.if_exists) return;
+        return Error.UnknownTable;
+    }
+
+    fn handleDropTrigger(self: *Engine, drop_trigger: sql.DropObject) Error!void {
+        const removed = self.triggers.fetchRemove(drop_trigger.object_name);
+        if (removed) |entry| {
+            self.allocator.free(entry.key);
+            var trigger = entry.value;
+            trigger.deinit(self.allocator);
+            return;
+        }
+        if (drop_trigger.if_exists) return;
         return Error.UnknownTable;
     }
 

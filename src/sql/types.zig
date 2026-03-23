@@ -6,10 +6,12 @@ pub const Statement = union(enum) {
     create_table: CreateTable,
     create_index: CreateIndex,
     create_view: CreateView,
+    create_trigger: CreateTrigger,
     insert: Insert,
     update: Update,
     drop_table: DropObject,
     drop_index: DropObject,
+    drop_trigger: DropObject,
     drop_view: DropObject,
     reindex: Reindex,
     select: Select,
@@ -31,6 +33,26 @@ pub const CreateIndex = struct {
 pub const CreateView = struct {
     view_name: []const u8,
     select_sql: []const u8,
+};
+
+pub const TriggerTiming = enum {
+    none,
+    before,
+    after,
+};
+
+pub const TriggerEvent = enum {
+    insert,
+    update,
+    delete,
+};
+
+pub const CreateTrigger = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    body_sql: []const u8,
 };
 
 pub const Insert = struct {
