@@ -136,11 +136,42 @@ fn parseFromList(allocator: std.mem.Allocator, text: []const u8) types.ParseErro
     var out = std.ArrayList(types.FromItem).empty;
     defer out.deinit(allocator);
     for (parts) |part| {
-        const item = try parseFromItem(allocator, part);
-        try out.append(allocator, item);
+        try appendFromPart(allocator, &out, part);
     }
     if (out.items.len == 0) return types.ParseError.InvalidSql;
     return out.toOwnedSlice(allocator);
+}
+
+fn appendFromPart(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(types.FromItem),
+    text: []const u8,
+) types.ParseError!void {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return types.ParseError.InvalidSql;
+
+    if (try splitTopLevelCrossJoin(allocator, trimmed)) |parts| {
+        for (parts) |part| {
+            try appendFromPart(allocator, out, part);
+        }
+        return;
+    }
+
+    if (trimmed[0] == '(') {
+        const close_idx = findMatchingCloseParen(trimmed) orelse return types.ParseError.InvalidSql;
+        if (close_idx == trimmed.len - 1) {
+            const inner = std.mem.trim(u8, trimmed[1..close_idx], " \t\r\n");
+            if (inner.len == 0) return types.ParseError.InvalidSql;
+            if (!startsWithKeyword(inner, "SELECT")) {
+                const nested = try parseFromList(allocator, inner);
+                for (nested) |item| try out.append(allocator, item);
+                return;
+            }
+        }
+    }
+
+    const item = try parseFromItem(allocator, trimmed);
+    try out.append(allocator, item);
 }
 
 fn findMatchingCloseParen(text: []const u8) ?usize {
@@ -167,6 +198,52 @@ fn findMatchingCloseParen(text: []const u8) ?usize {
         }
     }
     return null;
+}
+
+fn splitTopLevelCrossJoin(allocator: std.mem.Allocator, text: []const u8) !?[]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    defer out.deinit(allocator);
+
+    var depth: usize = 0;
+    var in_string = false;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i + "CROSS JOIN".len <= text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (c == '\'') in_string = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_string = true;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (depth != 0) continue;
+        if (!common.eqlIgnoreCase(text[i .. i + "CROSS JOIN".len], "CROSS JOIN")) continue;
+        if (!hasWordBoundaryBefore(text, i) or !hasWordBoundaryAfter(text, i + "CROSS JOIN".len)) continue;
+
+        const part = std.mem.trim(u8, text[start..i], " \t\r\n");
+        if (part.len == 0) return types.ParseError.InvalidSql;
+        try out.append(allocator, try allocator.dupe(u8, part));
+        start = i + "CROSS JOIN".len;
+        i = start - 1;
+    }
+
+    if (out.items.len == 0) return null;
+
+    const last = std.mem.trim(u8, text[start..], " \t\r\n");
+    if (last.len == 0) return types.ParseError.InvalidSql;
+    try out.append(allocator, try allocator.dupe(u8, last));
+    const owned = try out.toOwnedSlice(allocator);
+    return owned;
 }
 
 fn parseOrderBy(allocator: std.mem.Allocator, text: []const u8) types.ParseError![]const types.OrderTerm {
