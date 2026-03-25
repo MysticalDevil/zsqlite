@@ -108,6 +108,8 @@ pub const Select = struct {
     from: []const FromItem,
     projections: []const []const u8,
     where_expr: ?[]const u8,
+    group_by: []const []const u8,
+    having_expr: ?[]const u8,
     order_by: []const OrderTerm,
 };
 

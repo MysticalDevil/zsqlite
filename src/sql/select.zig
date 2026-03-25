@@ -84,7 +84,7 @@ fn parseFromItem(allocator: std.mem.Allocator, text: []const u8) types.ParseErro
 
         var alias_text = rest;
         if (common.startsWithIgnoreCase(rest, "AS ")) {
-            alias_text = std.mem.trim(u8, rest["AS ".len ..], " \t\r\n");
+            alias_text = std.mem.trim(u8, rest["AS ".len..], " \t\r\n");
         }
         if (alias_text.len == 0 or std.mem.indexOfAny(u8, alias_text, " \t\r\n") != null) return types.ParseError.InvalidSql;
 
@@ -303,10 +303,14 @@ fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.P
         const after_from_start = skipSpaces(sql_text, from_idx + "FROM".len);
         const after_from = sql_text[after_from_start..];
         const where_idx_rel = findTopLevelKeyword(after_from, "WHERE");
+        const group_idx_rel = findTopLevelGroupBy(after_from);
+        const having_idx_rel = findTopLevelHaving(after_from);
         const order_idx_rel = findTopLevelOrderBy(after_from);
 
         var from_end = after_from.len;
         if (where_idx_rel) |idx| from_end = @min(from_end, idx);
+        if (group_idx_rel) |idx| from_end = @min(from_end, idx);
+        if (having_idx_rel) |idx| from_end = @min(from_end, idx);
         if (order_idx_rel) |idx| from_end = @min(from_end, idx);
 
         const from_part = std.mem.trim(u8, after_from[0..from_end], " \t\r\n");
@@ -315,6 +319,29 @@ fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.P
 
         const where_expr = if (where_idx_rel) |widx| blk: {
             const start = widx + "WHERE".len;
+            var end = after_from.len;
+            if (group_idx_rel) |idx| end = @min(end, idx);
+            if (having_idx_rel) |idx| end = @min(end, idx);
+            if (order_idx_rel) |idx| end = @min(end, idx);
+            const text = std.mem.trim(u8, after_from[start..end], " \t\r\n");
+            if (text.len == 0) return types.ParseError.InvalidSql;
+            break :blk try allocator.dupe(u8, text);
+        } else null;
+
+        const group_by = if (group_idx_rel) |gidx| blk: {
+            const start = skipSpaces(after_from, gidx + "GROUP".len);
+            if (!startsWithKeyword(after_from[start..], "BY")) return types.ParseError.InvalidSql;
+            const expr_start = skipSpaces(after_from, start + "BY".len);
+            var end = after_from.len;
+            if (having_idx_rel) |idx| end = @min(end, idx);
+            if (order_idx_rel) |idx| end = @min(end, idx);
+            const text = std.mem.trim(u8, after_from[expr_start..end], " \t\r\n");
+            if (text.len == 0) return types.ParseError.InvalidSql;
+            break :blk try common.splitTopLevelComma(allocator, text);
+        } else try allocator.alloc([]const u8, 0);
+
+        const having_expr = if (having_idx_rel) |hidx| blk: {
+            const start = hidx + "HAVING".len;
             const end = if (order_idx_rel) |oidx| oidx else after_from.len;
             const text = std.mem.trim(u8, after_from[start..end], " \t\r\n");
             if (text.len == 0) return types.ParseError.InvalidSql;
@@ -331,14 +358,20 @@ fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.P
             .from = from_list,
             .projections = try common.splitTopLevelComma(allocator, proj_sql),
             .where_expr = where_expr,
+            .group_by = group_by,
+            .having_expr = having_expr,
             .order_by = order_by,
         } };
     }
 
     const where_idx = findTopLevelKeyword(sql_text, "WHERE");
+    const group_idx = findTopLevelGroupBy(sql_text);
+    const having_idx = findTopLevelHaving(sql_text);
     const order_idx = findTopLevelOrderBy(sql_text);
     var proj_end = sql_text.len;
     if (where_idx) |idx| proj_end = @min(proj_end, idx);
+    if (group_idx) |idx| proj_end = @min(proj_end, idx);
+    if (having_idx) |idx| proj_end = @min(proj_end, idx);
     if (order_idx) |idx| proj_end = @min(proj_end, idx);
 
     const proj_sql = std.mem.trim(u8, sql_text[projection_start..proj_end], " \t\r\n");
@@ -346,6 +379,29 @@ fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.P
 
     const where_expr = if (where_idx) |widx| blk: {
         const start = widx + "WHERE".len;
+        var end = sql_text.len;
+        if (group_idx) |idx| end = @min(end, idx);
+        if (having_idx) |idx| end = @min(end, idx);
+        if (order_idx) |idx| end = @min(end, idx);
+        const text = std.mem.trim(u8, sql_text[start..end], " \t\r\n");
+        if (text.len == 0) return types.ParseError.InvalidSql;
+        break :blk try allocator.dupe(u8, text);
+    } else null;
+
+    const group_by = if (group_idx) |gidx| blk: {
+        const start = skipSpaces(sql_text, gidx + "GROUP".len);
+        if (!startsWithKeyword(sql_text[start..], "BY")) return types.ParseError.InvalidSql;
+        const expr_start = skipSpaces(sql_text, start + "BY".len);
+        var end = sql_text.len;
+        if (having_idx) |idx| end = @min(end, idx);
+        if (order_idx) |idx| end = @min(end, idx);
+        const text = std.mem.trim(u8, sql_text[expr_start..end], " \t\r\n");
+        if (text.len == 0) return types.ParseError.InvalidSql;
+        break :blk try common.splitTopLevelComma(allocator, text);
+    } else try allocator.alloc([]const u8, 0);
+
+    const having_expr = if (having_idx) |hidx| blk: {
+        const start = hidx + "HAVING".len;
         const end = if (order_idx) |oidx| oidx else sql_text.len;
         const text = std.mem.trim(u8, sql_text[start..end], " \t\r\n");
         if (text.len == 0) return types.ParseError.InvalidSql;
@@ -362,8 +418,44 @@ fn parseSimpleSelect(allocator: std.mem.Allocator, sql_text: []const u8) types.P
         .from = try allocator.alloc(types.FromItem, 0),
         .projections = try common.splitTopLevelComma(allocator, proj_sql),
         .where_expr = where_expr,
+        .group_by = group_by,
+        .having_expr = having_expr,
         .order_by = order_by,
     } };
+}
+
+fn findTopLevelGroupBy(sql_text: []const u8) ?usize {
+    var in_string = false;
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < sql_text.len) : (i += 1) {
+        const c = sql_text[i];
+        if (in_string) {
+            if (c == '\'') in_string = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_string = true;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (depth != 0) continue;
+        if (!startsWithKeyword(sql_text[i..], "GROUP")) continue;
+        const next = skipSpaces(sql_text, i + "GROUP".len);
+        if (startsWithKeyword(sql_text[next..], "BY")) return i;
+    }
+    return null;
+}
+
+fn findTopLevelHaving(sql_text: []const u8) ?usize {
+    return findTopLevelKeyword(sql_text, "HAVING");
 }
 
 const MatchedSetOp = struct {
