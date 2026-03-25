@@ -27,6 +27,7 @@ pub const Table = struct {
     columns: std.ArrayList([]const u8),
     integer_affinity: std.ArrayList(bool),
     rows: std.ArrayList([]Value),
+    row_states: std.ArrayList(RowState),
     primary_key_col: ?usize,
 
     pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
@@ -34,6 +35,7 @@ pub const Table = struct {
         for (self.columns.items) |c| allocator.free(c);
         self.columns.deinit(allocator);
         self.integer_affinity.deinit(allocator);
+        self.row_states.deinit(allocator);
         for (self.rows.items) |row| {
             for (row) |v| switch (v) {
                 .text => |t| allocator.free(t),
@@ -43,6 +45,10 @@ pub const Table = struct {
             allocator.free(row);
         }
         self.rows.deinit(allocator);
+    }
+
+    pub fn isRowLive(self: *const Table, row_id: usize) bool {
+        return row_id < self.row_states.items.len and self.row_states.items[row_id] == .live;
     }
 };
 
@@ -58,4 +64,9 @@ pub const SortRow = struct {
     values: []Value,
     keys: []Value,
     descending: []bool,
+};
+
+pub const RowState = enum {
+    live,
+    tombstone,
 };

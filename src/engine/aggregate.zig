@@ -141,7 +141,8 @@ pub fn evalAggregateExpr(
             var min_value: ?f64 = null;
             var max_value: ?f64 = null;
 
-            for (table.rows.items) |source_row| {
+            for (table.rows.items, 0..) |source_row, row_id| {
+                if (!table.isRowLive(row_id)) continue;
                 var ctx = EvalCtx{
                     .table = table,
                     .table_name = sel.from[0].table_name,

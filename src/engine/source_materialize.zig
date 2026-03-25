@@ -31,6 +31,7 @@ pub fn materializeSubquery(
         .columns = std.ArrayList([]const u8).empty,
         .integer_affinity = std.ArrayList(bool).empty,
         .rows = std.ArrayList([]@import("../value.zig").Value).empty,
+        .row_states = std.ArrayList(@import("shared.zig").RowState).empty,
         .primary_key_col = null,
     };
     errdefer temp_table.deinit(allocator);
@@ -51,6 +52,7 @@ pub fn materializeSubquery(
             copied[i] = try result_utils.cloneResultValue(allocator, value);
         }
         try temp_table.rows.append(allocator, copied);
+        try temp_table.row_states.append(allocator, .live);
     }
     try temp_tables.append(allocator, temp_table);
     return temp_table;

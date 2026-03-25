@@ -9,6 +9,7 @@ pub const RowSet = types.RowSet;
 pub const Table = types.Table;
 pub const EvalCtx = types.EvalCtx;
 pub const SortRow = types.SortRow;
+pub const RowState = types.RowState;
 pub const QueryMetrics = runtime_mod.QueryMetrics;
 pub const QueryRuntime = runtime_mod.QueryRuntime;
 
@@ -26,6 +27,7 @@ pub const SourceRef = struct {
     table: *const Table,
     table_name: []const u8,
     alias: ?[]const u8,
+    index_hint: sql.IndexHint,
 };
 
 pub const ViewDef = struct {
@@ -60,6 +62,8 @@ pub const IndexDef = struct {
     table_name: []const u8,
     unique: bool,
     columns: std.ArrayList(sql.IndexColumn),
+    single_column_idx: ?usize,
+    entries: std.StringHashMap(std.ArrayList(usize)),
 
     pub fn deinit(self: *IndexDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -68,6 +72,12 @@ pub const IndexDef = struct {
             allocator.free(col.column_name);
         }
         self.columns.deinit(allocator);
+        var entry_it = self.entries.iterator();
+        while (entry_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        self.entries.deinit();
     }
 };
 
@@ -86,5 +96,3 @@ pub const Error = error{
 pub const ExecResult = struct {
     rows_affected: usize = 0,
 };
-
-pub const RowState = enum { row, done };

@@ -6,6 +6,7 @@ const expr_mod = @import("../expr/mod.zig");
 const result_utils = @import("result_utils.zig");
 const select_helpers = @import("select_helpers.zig");
 const shared = @import("shared.zig");
+const index_runtime = @import("index_runtime.zig");
 
 const Table = shared.Table;
 const EvalCtx = shared.EvalCtx;
@@ -59,6 +60,7 @@ pub fn handleCreate(self: anytype, create: sql.CreateTable) Error!void {
         .columns = std.ArrayList([]const u8).empty,
         .integer_affinity = std.ArrayList(bool).empty,
         .rows = std.ArrayList([]Value).empty,
+        .row_states = std.ArrayList(shared.RowState).empty,
         .primary_key_col = create.primary_key_col,
     };
     for (create.columns) |col| {
@@ -71,7 +73,7 @@ pub fn handleCreate(self: anytype, create: sql.CreateTable) Error!void {
 }
 
 pub fn handleCreateIndex(self: anytype, create: sql.CreateIndex) Error!void {
-    if (self.tables.getPtr(create.table_name) == null) return Error.UnknownTable;
+    const table = self.tables.getPtr(create.table_name) orelse return Error.UnknownTable;
     const key = try self.allocator.dupe(u8, create.index_name);
     errdefer self.allocator.free(key);
     const gop = try self.indexes.getOrPut(key);
@@ -94,7 +96,10 @@ pub fn handleCreateIndex(self: anytype, create: sql.CreateIndex) Error!void {
         .table_name = try self.allocator.dupe(u8, create.table_name),
         .unique = create.unique,
         .columns = columns,
+        .single_column_idx = null,
+        .entries = std.StringHashMap(std.ArrayList(usize)).init(self.allocator),
     };
+    try index_runtime.initializeIndex(self, gop.value_ptr, table);
 }
 
 pub fn handleCreateView(self: anytype, create: sql.CreateView) Error!void {
@@ -166,7 +171,7 @@ pub fn handleInsert(self: anytype, ins: sql.Insert) Error!void {
             if (values.len != table.columns.items.len) return Error.ColumnCountMismatch;
             for (values, 0..) |v, i| row[i] = try coerceValueForColumn(self, table, i, v);
         }
-        try storeInsertedRow(self, table, row, ins.or_replace);
+        try storeInsertedRow(self, table, ins.table_name, row, ins.or_replace);
         return;
     }
 
@@ -198,7 +203,7 @@ pub fn handleInsert(self: anytype, ins: sql.Insert) Error!void {
             if (src_row.len != table.columns.items.len) return Error.ColumnCountMismatch;
             for (src_row, 0..) |v, i| row[i] = try coerceValueForColumn(self, table, i, v);
         }
-        try storeInsertedRow(self, table, row, ins.or_replace);
+        try storeInsertedRow(self, table, ins.table_name, row, ins.or_replace);
     }
 }
 
@@ -228,7 +233,8 @@ pub fn handleUpdate(self: anytype, upd: sql.Update) Error!usize {
     defer runtime.deinit(self.allocator);
 
     var rows_affected: usize = 0;
-    for (table.rows.items) |row| {
+    for (table.rows.items, 0..) |row, row_id| {
+        if (!table.isRowLive(row_id)) continue;
         var ctx = EvalCtx{
             .table = table,
             .table_name = upd.table_name,
@@ -255,6 +261,8 @@ pub fn handleUpdate(self: anytype, upd: sql.Update) Error!usize {
             evaluated[i] = try result_utils.cloneResultValue(self.allocator, value);
         }
 
+        index_runtime.removeRowFromIndexes(self, upd.table_name, row, row_id);
+
         for (evaluated, 0..) |value, i| {
             switch (row[target_indexes[i]]) {
                 .text => |t| self.allocator.free(t),
@@ -269,6 +277,7 @@ pub fn handleUpdate(self: anytype, upd: sql.Update) Error!usize {
             }
             evaluated[i] = .null;
         }
+        try index_runtime.addRowToIndexes(self, upd.table_name, row, row_id);
         rows_affected += 1;
     }
 
@@ -293,6 +302,10 @@ pub fn handleDelete(self: anytype, del: sql.Delete) Error!usize {
     var rows_affected: usize = 0;
     var row_index: usize = 0;
     while (row_index < table.rows.items.len) {
+        if (!table.isRowLive(row_index)) {
+            row_index += 1;
+            continue;
+        }
         const row = table.rows.items[row_index];
         var ctx = EvalCtx{
             .table = table,
@@ -310,9 +323,9 @@ pub fn handleDelete(self: anytype, del: sql.Delete) Error!usize {
             }
         }
 
-        const removed = table.rows.orderedRemove(row_index);
-        result_utils.freeOwnedRow(self.allocator, removed);
+        try index_runtime.tombstoneRow(self, del.table_name, row_index);
         rows_affected += 1;
+        row_index += 1;
     }
 
     return rows_affected;
@@ -413,6 +426,7 @@ pub fn materializeView(
         .columns = std.ArrayList([]const u8).empty,
         .integer_affinity = std.ArrayList(bool).empty,
         .rows = std.ArrayList([]Value).empty,
+        .row_states = std.ArrayList(shared.RowState).empty,
         .primary_key_col = null,
     };
     errdefer temp_table.deinit(allocator);
@@ -427,25 +441,41 @@ pub fn materializeView(
             copied[i] = try result_utils.cloneResultValue(allocator, value);
         }
         try temp_table.rows.append(allocator, copied);
+        try temp_table.row_states.append(allocator, .live);
     }
     try temp_tables.append(allocator, temp_table);
     return temp_table;
 }
 
-fn storeInsertedRow(self: anytype, table: *Table, row: []Value, or_replace: bool) Error!void {
+fn storeInsertedRow(self: anytype, table: *Table, table_name: []const u8, row: []Value, or_replace: bool) Error!void {
+    var replace_row_id: ?usize = null;
     if (or_replace) {
         if (table.primary_key_col) |pk_idx| {
             const key = row[pk_idx];
-            for (table.rows.items) |*existing_row| {
+            for (table.rows.items, 0..) |*existing_row, row_id| {
+                if (!table.isRowLive(row_id)) continue;
                 if (existing_row.*[pk_idx].eql(key)) {
-                    result_utils.freeOwnedRow(self.allocator, existing_row.*);
-                    existing_row.* = row;
-                    return;
+                    replace_row_id = row_id;
+                    break;
                 }
             }
         }
     }
+
+    try index_runtime.checkInsertConflicts(self, table_name, table, row, replace_row_id, or_replace);
+
+    if (replace_row_id) |row_id| {
+        index_runtime.removeRowFromIndexes(self, table_name, table.rows.items[row_id], row_id);
+        result_utils.freeOwnedRow(self.allocator, table.rows.items[row_id]);
+        table.rows.items[row_id] = row;
+        table.row_states.items[row_id] = .live;
+        try index_runtime.addRowToIndexes(self, table_name, row, row_id);
+        return;
+    }
+
     try table.rows.append(self.allocator, row);
+    try table.row_states.append(self.allocator, .live);
+    try index_runtime.addRowToIndexes(self, table_name, row, table.rows.items.len - 1);
 }
 
 fn coerceValueForColumn(self: anytype, table: *const Table, col_idx: usize, value: Value) Error!Value {
