@@ -8,6 +8,7 @@ const shared = @import("shared.zig");
 const filter_plan = @import("filter_plan.zig");
 const source_materialize = @import("source_materialize.zig");
 const index_runtime = @import("index_runtime.zig");
+const aggregate = @import("aggregate.zig");
 
 const RowSet = shared.RowSet;
 const Table = shared.Table;
@@ -146,26 +147,8 @@ pub fn executeSelect(
         if (p.kind == .expr) try aggregate_exprs.append(ea, p.expr.?);
     }
 
-    if (ops.isAggregateProjectionList(aggregate_exprs.items)) {
-        if (aggregate_exprs.items.len != projections.items.len) return Error.InvalidSql;
-        if (sources.items.len != 1) return Error.UnsupportedSql;
-        const primary = sources.items[0];
-        const row = self.evalAggregateRow(
-            allocator,
-            primary.table,
-            sel,
-            aggregate_exprs.items,
-            where_expr,
-            parent_ctx,
-            primary.alias orelse primary.table_name,
-            rt,
-        ) catch |err| {
-            if (err == Error.AggregateEmpty) return result;
-            return err;
-        };
-        try result.rows.append(allocator, row);
-        return result;
-    }
+    const is_aggregate_query = ops.isAggregateProjectionList(aggregate_exprs.items);
+    if (is_aggregate_query and aggregate_exprs.items.len != projections.items.len) return Error.InvalidSql;
 
     const order_by_count = sel.order_by.len;
     var rows = std.ArrayList(SortRow).empty;
@@ -196,6 +179,9 @@ pub fn executeSelect(
     var residual_filters = std.ArrayList(*expr_mod.Expr).empty;
     defer residual_filters.deinit(allocator);
 
+    var aggregate_matches = std.ArrayList(usize).empty;
+    defer aggregate_matches.deinit(allocator);
+
     if (where_expr) |w| {
         var conjuncts = std.ArrayList(*expr_mod.Expr).empty;
         defer conjuncts.deinit(allocator);
@@ -220,6 +206,7 @@ pub fn executeSelect(
     }
     for (candidate_rows) |*list| list.* = std.ArrayList(usize).empty;
 
+    var has_empty_source = false;
     for (sources.items, 0..) |source, i| {
         const index_plan = try index_runtime.tryPlanIndexScan(self, allocator, source, local_filters[i].items);
         if (index_plan) |plan| {
@@ -269,7 +256,27 @@ pub fn executeSelect(
                 if (keep) try candidate_rows[i].append(allocator, row_idx);
             }
         }
-        if (candidate_rows[i].items.len == 0) return result;
+        if (candidate_rows[i].items.len == 0) {
+            has_empty_source = true;
+            if (!is_aggregate_query) return result;
+        }
+    }
+
+    if (is_aggregate_query and has_empty_source) {
+        const row = aggregate.evalAggregateRowForMatches(
+            self,
+            allocator,
+            aggregate_exprs.items,
+            sources.items,
+            parent_ctx,
+            rt,
+            aggregate_matches.items,
+        ) catch |err| {
+            if (err == Error.AggregateEmpty) return result;
+            return err;
+        };
+        try result.rows.append(allocator, row);
+        return result;
     }
 
     const source_lengths = try allocator.alloc(usize, sources.items.len);
@@ -442,6 +449,14 @@ pub fn executeSelect(
             }
         }
 
+        if (is_aggregate_query) {
+            for (sources.items, 0..) |_, source_idx| {
+                try aggregate_matches.append(allocator, candidate_rows[source_idx].items[idxs[source_idx]]);
+            }
+            idxs[src_idx] += 1;
+            continue;
+        }
+
         const out_row = try allocator.alloc(@import("../value.zig").Value, out_count);
         var out_idx: usize = 0;
         for (projections.items, 0..) |p, proj_idx| {
@@ -488,6 +503,23 @@ pub fn executeSelect(
             try rows.append(allocator, .{ .values = out_row, .keys = keys, .descending = descending });
         }
         idxs[src_idx] += 1;
+    }
+
+    if (is_aggregate_query) {
+        const row = aggregate.evalAggregateRowForMatches(
+            self,
+            allocator,
+            aggregate_exprs.items,
+            sources.items,
+            parent_ctx,
+            rt,
+            aggregate_matches.items,
+        ) catch |err| {
+            if (err == Error.AggregateEmpty) return result;
+            return err;
+        };
+        try result.rows.append(allocator, row);
+        return result;
     }
 
     if (order_by_count > 0) {

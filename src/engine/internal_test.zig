@@ -253,6 +253,52 @@ test "uncorrelated scalar subquery executes once per statement" {
     try std.testing.expect(m.subquery_cache_hits >= 49);
 }
 
+test "aggregate count works across multiple FROM sources" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(a, b)");
+    try db.exec("INSERT INTO t1 VALUES (1, 10)");
+    try db.exec("INSERT INTO t1 VALUES (2, 20)");
+
+    var rows = try db.query(
+        allocator,
+        "SELECT COUNT(*) FROM t1, t1 AS x WHERE t1.a < x.a",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 1 }));
+}
+
+test "aggregate expressions work across multiple FROM sources" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(a, b)");
+    try db.exec("INSERT INTO t1 VALUES (1, 3)");
+    try db.exec("INSERT INTO t1 VALUES (2, 7)");
+
+    var rows = try db.query(
+        allocator,
+        "SELECT 14, -COUNT(*), SUM(t1.b) + COUNT(*) FROM t1, t1 AS x WHERE t1.a < x.a",
+    );
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 14 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .integer = -1 }));
+    try std.testing.expect(rows.rows.items[0][2].eql(.{ .integer = 4 }));
+}
+
 test "uncorrelated exists subquery executes once per statement" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
