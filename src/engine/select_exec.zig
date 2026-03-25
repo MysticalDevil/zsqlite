@@ -9,6 +9,7 @@ const filter_plan = @import("filter_plan.zig");
 const source_materialize = @import("source_materialize.zig");
 const index_runtime = @import("index_runtime.zig");
 const aggregate = @import("aggregate.zig");
+const single_source_exec = @import("single_source_exec.zig");
 
 const RowSet = shared.RowSet;
 const Table = shared.Table;
@@ -18,6 +19,14 @@ const QueryRuntime = shared.QueryRuntime;
 const DepthFilterPlan = shared.DepthFilterPlan;
 const SourceRef = shared.SourceRef;
 const Error = shared.Error;
+const Value = @import("../value.zig").Value;
+
+const ProjectionKind = enum { expr, star_all, star_qualifier };
+const Projection = struct {
+    kind: ProjectionKind,
+    expr: ?*expr_mod.Expr,
+    qualifier: ?[]const u8,
+};
 
 pub fn executeSelect(
     self: anytype,
@@ -65,13 +74,6 @@ pub fn executeSelect(
         });
     }
 
-    const ProjectionKind = enum { expr, star_all, star_qualifier };
-    const Projection = struct {
-        kind: ProjectionKind,
-        expr: ?*expr_mod.Expr,
-        qualifier: ?[]const u8,
-    };
-
     var projections = std.ArrayList(Projection).empty;
     defer projections.deinit(ea);
     for (sel.projections) |text| {
@@ -96,6 +98,36 @@ pub fn executeSelect(
         expr_mod.parse(ea, w) catch return Error.InvalidSql
     else
         null;
+    var group_by_exprs = std.ArrayList(*expr_mod.Expr).empty;
+    defer group_by_exprs.deinit(ea);
+    for (sel.group_by) |text| {
+        const parsed = expr_mod.parse(ea, std.mem.trim(u8, text, " \t\r\n")) catch return Error.InvalidSql;
+        try group_by_exprs.append(ea, parsed);
+    }
+    const having_expr = if (sel.having_expr) |h|
+        expr_mod.parse(ea, h) catch return Error.InvalidSql
+    else
+        null;
+    var active_where_expr = where_expr;
+    var constant_where_value: ?bool = null;
+
+    if (active_where_expr) |w| {
+        const dep = try select_helpers.exprDependency(w, sources.items, ops.eqlIgnoreCase);
+        if (dep.supported and dep.mask == 0 and sources.items.len != 0) {
+            var ctx = EvalCtx{
+                .table = sources.items[0].table,
+                .table_name = sources.items[0].table_name,
+                .alias = sources.items[0].alias,
+                .row = null,
+                .parent = parent_ctx,
+            };
+            const cond = try self.evalExpr(allocator, w, &ctx, rt);
+            constant_where_value = ops.toSqlBool(cond);
+            if (constant_where_value.?) {
+                active_where_expr = null;
+            }
+        }
+    }
 
     var order_exprs = std.ArrayList(?*expr_mod.Expr).empty;
     defer order_exprs.deinit(ea);
@@ -113,6 +145,7 @@ pub fn executeSelect(
             .name = "",
             .columns = std.ArrayList([]const u8).empty,
             .integer_affinity = std.ArrayList(bool).empty,
+            .column_has_null = std.ArrayList(bool).empty,
             .rows = std.ArrayList([]@import("../value.zig").Value).empty,
             .row_states = std.ArrayList(shared.RowState).empty,
             .primary_key_col = null,
@@ -148,7 +181,31 @@ pub fn executeSelect(
     }
 
     const is_aggregate_query = ops.isAggregateProjectionList(aggregate_exprs.items);
+    const is_grouped_query = group_by_exprs.items.len > 0;
     if (is_aggregate_query and aggregate_exprs.items.len != projections.items.len) return Error.InvalidSql;
+
+    if (constant_where_value != null and !constant_where_value.? and (!is_aggregate_query or is_grouped_query)) {
+        return result;
+    }
+
+    if (!is_aggregate_query and
+        !is_grouped_query and
+        having_expr == null and
+        sources.items.len == 1 and
+        sel.order_by.len == 0 and
+        !sel.distinct and
+        sources.items[0].index_hint == .none)
+    {
+        return single_source_exec.executeSingleSourceNoOrderNoDistinct(
+            self,
+            allocator,
+            sources.items[0],
+            projections.items,
+            active_where_expr,
+            parent_ctx,
+            rt,
+        );
+    }
 
     const order_by_count = sel.order_by.len;
     var rows = std.ArrayList(SortRow).empty;
@@ -182,7 +239,7 @@ pub fn executeSelect(
     var aggregate_matches = std.ArrayList(usize).empty;
     defer aggregate_matches.deinit(allocator);
 
-    if (where_expr) |w| {
+    if (active_where_expr) |w| {
         var conjuncts = std.ArrayList(*expr_mod.Expr).empty;
         defer conjuncts.deinit(allocator);
         try select_helpers.collectAndConjuncts(allocator, w, &conjuncts);
@@ -258,9 +315,11 @@ pub fn executeSelect(
         }
         if (candidate_rows[i].items.len == 0) {
             has_empty_source = true;
-            if (!is_aggregate_query) return result;
+            if (!is_aggregate_query or is_grouped_query) return result;
         }
     }
+
+    if (is_grouped_query and has_empty_source) return result;
 
     if (is_aggregate_query and has_empty_source) {
         const row = aggregate.evalAggregateRowForMatches(
@@ -449,7 +508,7 @@ pub fn executeSelect(
             }
         }
 
-        if (is_aggregate_query) {
+        if (is_aggregate_query or is_grouped_query) {
             for (sources.items, 0..) |_, source_idx| {
                 try aggregate_matches.append(allocator, candidate_rows[source_idx].items[idxs[source_idx]]);
             }
@@ -505,6 +564,27 @@ pub fn executeSelect(
         idxs[src_idx] += 1;
     }
 
+    if (is_grouped_query) {
+        try emitGroupedRows(
+            self,
+            allocator,
+            &result,
+            projections.items,
+            projection_source_idxs,
+            out_count,
+            sources.items,
+            parent_ctx,
+            rt,
+            aggregate_matches.items,
+            group_by_exprs.items,
+            having_expr,
+            sel.order_by,
+            order_exprs.items,
+        );
+        if (sel.distinct) result_utils.dedupRowsInPlace(allocator, &result);
+        return result;
+    }
+
     if (is_aggregate_query) {
         const row = aggregate.evalAggregateRowForMatches(
             self,
@@ -530,6 +610,198 @@ pub fn executeSelect(
     }
     if (sel.distinct) result_utils.dedupRowsInPlace(allocator, &result);
     return result;
+}
+
+fn emitGroupedRows(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    result: *RowSet,
+    projections: []const Projection,
+    projection_source_idxs: []const ?usize,
+    out_count: usize,
+    sources: []const SourceRef,
+    parent_ctx: ?*const EvalCtx,
+    runtime: *QueryRuntime,
+    matched_row_ids: []const usize,
+    group_by_exprs: []const *expr_mod.Expr,
+    having_expr: ?*expr_mod.Expr,
+    order_terms: []const sql.OrderTerm,
+    order_exprs: []const ?*expr_mod.Expr,
+) Error!void {
+    const GroupState = struct {
+        keys: []Value,
+        matches: std.ArrayList(usize),
+    };
+
+    var groups = std.ArrayList(GroupState).empty;
+    defer {
+        for (groups.items) |*group| {
+            result_utils.freeOwnedRow(allocator, group.keys);
+            group.matches.deinit(allocator);
+        }
+        groups.deinit(allocator);
+    }
+
+    const ctx_by_source = try allocator.alloc(EvalCtx, sources.len);
+    defer allocator.free(ctx_by_source);
+
+    var base: usize = 0;
+    while (base < matched_row_ids.len) : (base += sources.len) {
+        const row_ids = matched_row_ids[base .. base + sources.len];
+        buildCtxChain(ctx_by_source, sources, parent_ctx, row_ids);
+        const ctx = &ctx_by_source[sources.len - 1];
+
+        const keys = try allocator.alloc(Value, group_by_exprs.len);
+        errdefer result_utils.freeOwnedRow(allocator, keys);
+        for (keys) |*key| key.* = .null;
+        for (group_by_exprs, 0..) |gexpr, i| {
+            const value = try self.evalExpr(allocator, gexpr, ctx, runtime);
+            keys[i] = try result_utils.cloneResultValue(allocator, value);
+        }
+
+        var existing_group: ?usize = null;
+        for (groups.items, 0..) |group, i| {
+            if (groupKeysEqual(group.keys, keys)) {
+                existing_group = i;
+                break;
+            }
+        }
+
+        if (existing_group) |group_idx| {
+            result_utils.freeOwnedRow(allocator, keys);
+            try groups.items[group_idx].matches.appendSlice(allocator, row_ids);
+            continue;
+        }
+
+        var matches = std.ArrayList(usize).empty;
+        errdefer matches.deinit(allocator);
+        try matches.appendSlice(allocator, row_ids);
+        try groups.append(allocator, .{ .keys = keys, .matches = matches });
+    }
+
+    var ordered_rows = std.ArrayList(SortRow).empty;
+    defer {
+        for (ordered_rows.items) |entry| {
+            allocator.free(entry.keys);
+            allocator.free(entry.descending);
+        }
+        ordered_rows.deinit(allocator);
+    }
+
+    for (groups.items) |group| {
+        buildCtxChain(ctx_by_source, sources, parent_ctx, group.matches.items[0..sources.len]);
+        const ctx = &ctx_by_source[sources.len - 1];
+
+        if (having_expr) |having| {
+            const cond = try evalGroupedExpr(self, allocator, having, ctx, sources, parent_ctx, runtime, group.matches.items);
+            if (!ops.toSqlBool(cond)) continue;
+        }
+
+        const out_row = try allocator.alloc(Value, out_count);
+        errdefer result_utils.freeOwnedRow(allocator, out_row);
+        for (out_row) |*value| value.* = .null;
+
+        var out_idx: usize = 0;
+        for (projections, 0..) |p, proj_idx| {
+            switch (p.kind) {
+                .expr => {
+                    const value = try evalGroupedExpr(self, allocator, p.expr.?, ctx, sources, parent_ctx, runtime, group.matches.items);
+                    out_row[out_idx] = try result_utils.cloneResultValue(allocator, value);
+                    out_idx += 1;
+                },
+                .star_all => {
+                    for (sources, 0..) |_, source_idx| {
+                        for (ctx_by_source[source_idx].row.?) |value| {
+                            out_row[out_idx] = try result_utils.cloneResultValue(allocator, value);
+                            out_idx += 1;
+                        }
+                    }
+                },
+                .star_qualifier => {
+                    const qualified_src_idx = projection_source_idxs[proj_idx] orelse return Error.UnknownColumn;
+                    for (ctx_by_source[qualified_src_idx].row.?) |value| {
+                        out_row[out_idx] = try result_utils.cloneResultValue(allocator, value);
+                        out_idx += 1;
+                    }
+                },
+            }
+        }
+
+        if (order_terms.len == 0) {
+            try result.rows.append(allocator, out_row);
+            continue;
+        }
+
+        const keys = try allocator.alloc(Value, order_terms.len);
+        for (keys) |*value| value.* = .null;
+        errdefer result_utils.freeOwnedRow(allocator, keys);
+
+        const descending = try allocator.alloc(bool, order_terms.len);
+        errdefer allocator.free(descending);
+
+        for (order_terms, 0..) |term, i| {
+            descending[i] = term.descending;
+            if (term.is_ordinal) {
+                if (term.ordinal == 0 or term.ordinal > out_row.len) return Error.InvalidSql;
+                keys[i] = try result_utils.cloneResultValue(allocator, out_row[term.ordinal - 1]);
+            } else {
+                const order_expr = order_exprs[i] orelse return Error.InvalidSql;
+                const value = try evalGroupedExpr(self, allocator, order_expr, ctx, sources, parent_ctx, runtime, group.matches.items);
+                keys[i] = try result_utils.cloneResultValue(allocator, value);
+            }
+        }
+
+        try ordered_rows.append(allocator, .{ .values = out_row, .keys = keys, .descending = descending });
+    }
+
+    if (order_terms.len > 0) {
+        std.sort.heap(SortRow, ordered_rows.items, {}, result_utils.sortRowLessThan);
+        for (ordered_rows.items) |entry| {
+            try result.rows.append(allocator, entry.values);
+        }
+    }
+}
+
+fn evalGroupedExpr(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    expr: *expr_mod.Expr,
+    ctx: *const EvalCtx,
+    sources: []const SourceRef,
+    parent_ctx: ?*const EvalCtx,
+    runtime: *QueryRuntime,
+    matched_row_ids: []const usize,
+) Error!Value {
+    if (ops.containsAggregateCall(expr)) {
+        return aggregate.evalExprForMatches(self, allocator, expr, sources, parent_ctx, runtime, matched_row_ids);
+    }
+    return self.evalExpr(allocator, expr, ctx, runtime);
+}
+
+fn buildCtxChain(
+    ctx_by_source: []EvalCtx,
+    sources: []const SourceRef,
+    parent_ctx: ?*const EvalCtx,
+    row_ids: []const usize,
+) void {
+    for (sources, 0..) |source, i| {
+        const parent = if (i == 0) parent_ctx else &ctx_by_source[i - 1];
+        ctx_by_source[i] = .{
+            .table = source.table,
+            .table_name = source.table_name,
+            .alias = source.alias,
+            .row = source.table.rows.items[row_ids[i]],
+            .parent = parent,
+        };
+    }
+}
+
+fn groupKeysEqual(left: []const Value, right: []const Value) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |lhs, rhs| {
+        if (ops.compareValues(lhs, rhs) != 0) return false;
+    }
+    return true;
 }
 
 fn normalizeProjectionExpr(text: []const u8) []const u8 {
@@ -605,6 +877,10 @@ fn findTopLevelBareAlias(text: []const u8) ?usize {
     if (prefix.len == 0 or suffix.len == 0) return null;
     for (suffix) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+    }
+    const reserved = [_][]const u8{ "END", "ELSE", "WHEN", "THEN", "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET" };
+    for (reserved) |word| {
+        if (ops.eqlIgnoreCase(suffix, word)) return null;
     }
     const last = prefix[prefix.len - 1];
     if (last == '+' or last == '-' or last == '*' or last == '/' or last == '(' or last == ',' or last == '<' or last == '>' or last == '=') {
