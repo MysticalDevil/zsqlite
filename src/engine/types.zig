@@ -26,6 +26,7 @@ pub const Table = struct {
     name: []const u8,
     columns: std.ArrayList([]const u8),
     integer_affinity: std.ArrayList(bool),
+    column_has_null: std.ArrayList(bool),
     rows: std.ArrayList([]Value),
     row_states: std.ArrayList(RowState),
     primary_key_col: ?usize,
@@ -35,6 +36,7 @@ pub const Table = struct {
         for (self.columns.items) |c| allocator.free(c);
         self.columns.deinit(allocator);
         self.integer_affinity.deinit(allocator);
+        self.column_has_null.deinit(allocator);
         self.row_states.deinit(allocator);
         for (self.rows.items) |row| {
             for (row) |v| switch (v) {

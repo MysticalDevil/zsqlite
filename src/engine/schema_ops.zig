@@ -59,6 +59,7 @@ pub fn handleCreate(self: anytype, create: sql.CreateTable) Error!void {
         .name = try self.allocator.dupe(u8, create.table_name),
         .columns = std.ArrayList([]const u8).empty,
         .integer_affinity = std.ArrayList(bool).empty,
+        .column_has_null = std.ArrayList(bool).empty,
         .rows = std.ArrayList([]Value).empty,
         .row_states = std.ArrayList(shared.RowState).empty,
         .primary_key_col = create.primary_key_col,
@@ -68,6 +69,9 @@ pub fn handleCreate(self: anytype, create: sql.CreateTable) Error!void {
     }
     for (create.integer_affinity) |affinity| {
         try table.integer_affinity.append(self.allocator, affinity);
+    }
+    for (create.columns) |_| {
+        try table.column_has_null.append(self.allocator, false);
     }
     gop.value_ptr.* = table;
 }
@@ -425,6 +429,7 @@ pub fn materializeView(
         .name = try allocator.dupe(u8, view.name),
         .columns = std.ArrayList([]const u8).empty,
         .integer_affinity = std.ArrayList(bool).empty,
+        .column_has_null = std.ArrayList(bool).empty,
         .rows = std.ArrayList([]Value).empty,
         .row_states = std.ArrayList(shared.RowState).empty,
         .primary_key_col = null,
@@ -434,11 +439,13 @@ pub fn materializeView(
     for (view.columns.items) |column_name| {
         try temp_table.columns.append(allocator, try allocator.dupe(u8, column_name));
         try temp_table.integer_affinity.append(allocator, false);
+        try temp_table.column_has_null.append(allocator, false);
     }
     for (row_set.rows.items) |row| {
         const copied = try allocator.alloc(Value, row.len);
         for (row, 0..) |value, i| {
             copied[i] = try result_utils.cloneResultValue(allocator, value);
+            if (value == .null) temp_table.column_has_null.items[i] = true;
         }
         try temp_table.rows.append(allocator, copied);
         try temp_table.row_states.append(allocator, .live);
@@ -469,12 +476,18 @@ fn storeInsertedRow(self: anytype, table: *Table, table_name: []const u8, row: [
         result_utils.freeOwnedRow(self.allocator, table.rows.items[row_id]);
         table.rows.items[row_id] = row;
         table.row_states.items[row_id] = .live;
+        for (row, 0..) |value, col_idx| {
+            if (value == .null) table.column_has_null.items[col_idx] = true;
+        }
         try index_runtime.addRowToIndexes(self, table_name, row, row_id);
         return;
     }
 
     try table.rows.append(self.allocator, row);
     try table.row_states.append(self.allocator, .live);
+    for (row, 0..) |value, col_idx| {
+        if (value == .null) table.column_has_null.items[col_idx] = true;
+    }
     try index_runtime.addRowToIndexes(self, table_name, row, table.rows.items.len - 1);
 }
 

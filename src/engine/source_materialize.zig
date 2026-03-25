@@ -30,6 +30,7 @@ pub fn materializeSubquery(
         .name = try allocator.dupe(u8, alias),
         .columns = std.ArrayList([]const u8).empty,
         .integer_affinity = std.ArrayList(bool).empty,
+        .column_has_null = std.ArrayList(bool).empty,
         .rows = std.ArrayList([]@import("../value.zig").Value).empty,
         .row_states = std.ArrayList(@import("shared.zig").RowState).empty,
         .primary_key_col = null,
@@ -44,12 +45,14 @@ pub fn materializeSubquery(
     for (column_names) |name| {
         try temp_table.columns.append(allocator, try allocator.dupe(u8, name));
         try temp_table.integer_affinity.append(allocator, false);
+        try temp_table.column_has_null.append(allocator, false);
     }
 
     for (row_set.rows.items) |row| {
         const copied = try allocator.alloc(@import("../value.zig").Value, row.len);
         for (row, 0..) |value, i| {
             copied[i] = try result_utils.cloneResultValue(allocator, value);
+            if (value == .null) temp_table.column_has_null.items[i] = true;
         }
         try temp_table.rows.append(allocator, copied);
         try temp_table.row_states.append(allocator, .live);
