@@ -297,7 +297,7 @@ pub fn evalAggregateRowForMatches(
 ) Error![]Value {
     const row = try allocator.alloc(Value, projections.len);
     for (projections, 0..) |pexpr, i| {
-        row[i] = try evalAggregateExprForMatches(
+        row[i] = try evalExprForMatches(
             self,
             allocator,
             pexpr,
@@ -310,7 +310,7 @@ pub fn evalAggregateRowForMatches(
     return row;
 }
 
-fn evalAggregateExprForMatches(
+pub fn evalExprForMatches(
     self: anytype,
     allocator: std.mem.Allocator,
     pexpr: *@import("../expr/mod.zig").Expr,
@@ -319,10 +319,37 @@ fn evalAggregateExprForMatches(
     runtime: *QueryRuntime,
     matched_row_ids: []const usize,
 ) Error!Value {
+    if (!ops.containsAggregateCall(pexpr)) {
+        if (sources.len == 0 or matched_row_ids.len < sources.len) {
+            var dummy_table = Table{
+                .name = "",
+                .columns = std.ArrayList([]const u8).empty,
+                .integer_affinity = std.ArrayList(bool).empty,
+                .column_has_null = std.ArrayList(bool).empty,
+                .rows = std.ArrayList([]Value).empty,
+                .row_states = std.ArrayList(shared.RowState).empty,
+                .primary_key_col = null,
+            };
+            const ctx = EvalCtx{
+                .table = &dummy_table,
+                .table_name = "",
+                .alias = null,
+                .row = null,
+                .parent = parent_ctx,
+            };
+            return self.evalExpr(allocator, pexpr, &ctx, runtime);
+        }
+
+        const ctx_by_source = try allocator.alloc(EvalCtx, sources.len);
+        defer allocator.free(ctx_by_source);
+        buildCtxChain(ctx_by_source, sources, parent_ctx, matched_row_ids[0..sources.len]);
+        return self.evalExpr(allocator, pexpr, &ctx_by_source[sources.len - 1], runtime);
+    }
+
     switch (pexpr.*) {
         .literal => |v| return v,
         .cast_expr => |cast_expr| {
-            const value = try evalAggregateExprForMatches(self, allocator, cast_expr.expr, sources, parent_ctx, runtime, matched_row_ids);
+            const value = try evalExprForMatches(self, allocator, cast_expr.expr, sources, parent_ctx, runtime, matched_row_ids);
             if (value == .null) return .null;
             if (ops.eqlIgnoreCase(cast_expr.target_type, "INTEGER")) {
                 return switch (value) {
@@ -342,7 +369,7 @@ fn evalAggregateExprForMatches(
             return value;
         },
         .unary => |u| {
-            const inner = try evalAggregateExprForMatches(self, allocator, u.expr, sources, parent_ctx, runtime, matched_row_ids);
+            const inner = try evalExprForMatches(self, allocator, u.expr, sources, parent_ctx, runtime, matched_row_ids);
             switch (u.op) {
                 .neg => {
                     if (inner == .null) return .null;
@@ -358,8 +385,8 @@ fn evalAggregateExprForMatches(
             }
         },
         .binary => |b| {
-            const left = try evalAggregateExprForMatches(self, allocator, b.left, sources, parent_ctx, runtime, matched_row_ids);
-            const right = try evalAggregateExprForMatches(self, allocator, b.right, sources, parent_ctx, runtime, matched_row_ids);
+            const left = try evalExprForMatches(self, allocator, b.left, sources, parent_ctx, runtime, matched_row_ids);
+            const right = try evalExprForMatches(self, allocator, b.right, sources, parent_ctx, runtime, matched_row_ids);
             if (b.op == .and_op) {
                 if (left != .null and !ops.toSqlBool(left)) return Value{ .integer = 0 };
                 if (right != .null and !ops.toSqlBool(right)) return Value{ .integer = 0 };
@@ -375,9 +402,9 @@ fn evalAggregateExprForMatches(
             return ops.evalBinary(b.op, left, right);
         },
         .between => |b| {
-            const target = try evalAggregateExprForMatches(self, allocator, b.target, sources, parent_ctx, runtime, matched_row_ids);
-            const low = try evalAggregateExprForMatches(self, allocator, b.low, sources, parent_ctx, runtime, matched_row_ids);
-            const high = try evalAggregateExprForMatches(self, allocator, b.high, sources, parent_ctx, runtime, matched_row_ids);
+            const target = try evalExprForMatches(self, allocator, b.target, sources, parent_ctx, runtime, matched_row_ids);
+            const low = try evalExprForMatches(self, allocator, b.low, sources, parent_ctx, runtime, matched_row_ids);
+            const high = try evalExprForMatches(self, allocator, b.high, sources, parent_ctx, runtime, matched_row_ids);
             const ge = ops.evalBinary(.ge, target, low);
             const le = ops.evalBinary(.le, target, high);
             const between_value = sqlAnd(ge, le);
@@ -385,7 +412,7 @@ fn evalAggregateExprForMatches(
             return between_value;
         },
         .is_null => |n| {
-            const value = try evalAggregateExprForMatches(self, allocator, n.target, sources, parent_ctx, runtime, matched_row_ids);
+            const value = try evalExprForMatches(self, allocator, n.target, sources, parent_ctx, runtime, matched_row_ids);
             const is_null = value == .null;
             return Value{ .integer = if (if (n.not_null) !is_null else is_null) 1 else 0 };
         },
