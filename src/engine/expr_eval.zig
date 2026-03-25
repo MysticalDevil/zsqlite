@@ -165,6 +165,20 @@ pub fn evalExpr(
                 }
                 return .null;
             }
+            if (ops.eqlIgnoreCase(call.name, "ifnull")) {
+                if (call.args.len != 2) return Error.InvalidSql;
+                const left = try evalExpr(self, allocator, call.args[0], ctx, runtime);
+                if (left != .null) return left;
+                return evalExpr(self, allocator, call.args[1], ctx, runtime);
+            }
+            if (ops.eqlIgnoreCase(call.name, "nullif")) {
+                if (call.args.len != 2) return Error.InvalidSql;
+                const left = try evalExpr(self, allocator, call.args[0], ctx, runtime);
+                const right = try evalExpr(self, allocator, call.args[1], ctx, runtime);
+                if (left == .null or right == .null) return left;
+                if (ops.compareValues(left, right) == 0) return .null;
+                return left;
+            }
             return Error.UnsupportedSql;
         },
         .case_expr => |c| {
