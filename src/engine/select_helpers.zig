@@ -15,13 +15,20 @@ pub fn parseQualifiedStar(text: []const u8) ?[]const u8 {
 pub fn findQualifiedSourceIndex(sources: anytype, qualifier: []const u8, eqlIgnoreCase: fn ([]const u8, []const u8) bool) ?usize {
     var found: ?usize = null;
     for (sources, 0..) |source, i| {
-        const matches = eqlIgnoreCase(qualifier, source.table_name) or
-            (source.alias != null and eqlIgnoreCase(qualifier, source.alias.?));
+        const matches = sourceMatchesQualifier(source, qualifier, eqlIgnoreCase);
         if (!matches) continue;
         if (found != null) return null;
         found = i;
     }
     return found;
+}
+
+pub fn sourceMatchesQualifier(source: anytype, qualifier: []const u8, eqlIgnoreCase: fn ([]const u8, []const u8) bool) bool {
+    if (eqlIgnoreCase(qualifier, source.table_name)) return true;
+    if (source.alias) |alias| {
+        return eqlIgnoreCase(qualifier, alias);
+    }
+    return false;
 }
 
 pub const ExprDependency = struct {
