@@ -231,8 +231,7 @@ fn lookupBestIndexRows(
 
 fn lookupRowsForValues(allocator: std.mem.Allocator, index_def: *const IndexDef, values: []const Value) Error![]usize {
     var out = std.ArrayList(usize).empty;
-    defer out.deinit(allocator);
-
+    errdefer out.deinit(allocator);
     for (values) |value| {
         const row_ids = try lookupRowIds(allocator, index_def, value);
         defer if (row_ids.owned) allocator.free(row_ids.items);
@@ -384,7 +383,7 @@ fn extractIdentifierColumn(source: SourceRef, node: *expr_mod.Expr) Error!?[]con
 
 fn intersectRowIds(allocator: std.mem.Allocator, left: []const usize, right: []const usize) std.mem.Allocator.Error![]usize {
     var out = std.ArrayList(usize).empty;
-    defer out.deinit(allocator);
+    errdefer out.deinit(allocator);
     for (left) |row_id| {
         if (!containsUsize(right, row_id)) continue;
         if (containsUsize(out.items, row_id)) continue;
@@ -395,7 +394,7 @@ fn intersectRowIds(allocator: std.mem.Allocator, left: []const usize, right: []c
 
 fn unionRowIds(allocator: std.mem.Allocator, left: []const usize, right: []const usize) std.mem.Allocator.Error![]usize {
     var out = std.ArrayList(usize).empty;
-    defer out.deinit(allocator);
+    errdefer out.deinit(allocator);
     for (left) |row_id| {
         if (containsUsize(out.items, row_id)) continue;
         try out.append(allocator, row_id);
