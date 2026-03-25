@@ -513,3 +513,80 @@ test "drop table removes attached triggers" {
     try std.testing.expectError(engine_mod.Error.UnknownTable, db.exec("DROP TRIGGER tr_after"));
     try std.testing.expectError(engine_mod.Error.UnknownTable, db.exec("DROP TRIGGER tr_plain"));
 }
+
+test "unique index rejects duplicate insert" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("CREATE UNIQUE INDEX idx_x ON t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+    try std.testing.expectError(engine_mod.Error.TableAlreadyExists, db.exec("INSERT INTO t1 VALUES (1)"));
+}
+
+test "replace resolves unique index conflicts" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(id INTEGER PRIMARY KEY, x)");
+    try db.exec("CREATE UNIQUE INDEX idx_x ON t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    try db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    try db.exec("REPLACE INTO t1 VALUES (3, 'a')");
+
+    var rows = try db.query(allocator, "SELECT id, x FROM t1 ORDER BY 1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
+    try std.testing.expect(rows.rows.items[0][1].eql(.{ .text = "b" }));
+    try std.testing.expect(rows.rows.items[1][0].eql(.{ .integer = 3 }));
+    try std.testing.expect(rows.rows.items[1][1].eql(.{ .text = "a" }));
+}
+
+test "indexed by requires an indexable predicate" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("CREATE INDEX idx_x ON t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+
+    try std.testing.expectError(
+        engine_mod.Error.UnsupportedSql,
+        db.query(allocator, "SELECT * FROM t1 INDEXED BY idx_x"),
+    );
+}
+
+test "delete removes row from index-backed candidates" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var db = engine_mod.Engine.init(allocator);
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE t1(x)");
+    try db.exec("CREATE INDEX idx_x ON t1(x)");
+    try db.exec("INSERT INTO t1 VALUES (1)");
+    try db.exec("INSERT INTO t1 VALUES (2)");
+    try db.exec("DELETE FROM t1 WHERE x=1");
+
+    var rows = try db.query(allocator, "SELECT x FROM t1 INDEXED BY idx_x WHERE x IN (1, 2) ORDER BY 1");
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(rows.rows.items[0][0].eql(.{ .integer = 2 }));
+}

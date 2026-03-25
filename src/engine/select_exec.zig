@@ -7,6 +7,7 @@ const select_helpers = @import("select_helpers.zig");
 const shared = @import("shared.zig");
 const filter_plan = @import("filter_plan.zig");
 const source_materialize = @import("source_materialize.zig");
+const index_runtime = @import("index_runtime.zig");
 
 const RowSet = shared.RowSet;
 const Table = shared.Table;
@@ -59,6 +60,7 @@ pub fn executeSelect(
             .table = table,
             .table_name = from_item.table_name,
             .alias = from_item.alias,
+            .index_hint = from_item.index_hint,
         });
     }
 
@@ -111,6 +113,7 @@ pub fn executeSelect(
             .columns = std.ArrayList([]const u8).empty,
             .integer_affinity = std.ArrayList(bool).empty,
             .rows = std.ArrayList([]@import("../value.zig").Value).empty,
+            .row_states = std.ArrayList(shared.RowState).empty,
             .primary_key_col = null,
         };
         var ctx = EvalCtx{
@@ -218,12 +221,36 @@ pub fn executeSelect(
     for (candidate_rows) |*list| list.* = std.ArrayList(usize).empty;
 
     for (sources.items, 0..) |source, i| {
-        if (local_filters[i].items.len == 0) {
+        const index_plan = try index_runtime.tryPlanIndexScan(self, allocator, source, local_filters[i].items);
+        if (index_plan) |plan| {
+            defer allocator.free(plan.row_ids);
+            for (plan.row_ids) |row_id| {
+                if (!source.table.isRowLive(row_id)) continue;
+                var local_ctx = EvalCtx{
+                    .table = source.table,
+                    .table_name = source.table_name,
+                    .alias = source.alias,
+                    .row = source.table.rows.items[row_id],
+                    .parent = parent_ctx,
+                };
+                var keep = true;
+                for (local_filters[i].items) |filter_expr| {
+                    const cond_val = try self.evalExpr(allocator, filter_expr, &local_ctx, rt);
+                    if (!ops.toSqlBool(cond_val)) {
+                        keep = false;
+                        break;
+                    }
+                }
+                if (keep) try candidate_rows[i].append(allocator, row_id);
+            }
+        } else if (local_filters[i].items.len == 0) {
             for (source.table.rows.items, 0..) |_, row_idx| {
+                if (!source.table.isRowLive(row_idx)) continue;
                 try candidate_rows[i].append(allocator, row_idx);
             }
         } else {
             for (source.table.rows.items, 0..) |row, row_idx| {
+                if (!source.table.isRowLive(row_idx)) continue;
                 var local_ctx = EvalCtx{
                     .table = source.table,
                     .table_name = source.table_name,
